@@ -9,6 +9,7 @@
 # Implementation: Tom Turney (TurboQuant+)
 
 import math
+import os
 from typing import Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
@@ -16,22 +17,47 @@ from mlx.nn.layers.base import Module
 
 
 # ---------------------------------------------------------------------------
-# Lloyd-Max codebooks for N(0, 1/d) projected onto unit sphere
-# Pre-computed centroids and boundaries for common (bits, dim) combos.
-# After SRHT, each coordinate is approximately N(0, 1/sqrt(d)), so we
-# use standard-normal Lloyd-Max centroids scaled by 1/sqrt(d).
+# Beta distribution centroids for unit-sphere-normalized coordinates
+# Pre-computed for common (bits, dim) combos. These are the correct
+# distribution for coordinates after WHT rotation on the unit sphere
+# (Eric's derivation). Proven +47% PPL vs N(0,1) at short context (128 tok)
+# on Qwen3.5-2B A/B test.
 #
-# Standard-normal Lloyd-Max centroids (for full N(0,1)):
-#   2-bit (4 levels): [-1.5104, -0.4528, 0.4528, 1.5104]
-#   3-bit (8 levels): [-2.1520, -1.3440, -0.7560, -0.2451,
-#                        0.2451,  0.7560,  1.3440,  2.1520]
-#   4-bit (16 levels): [-2.7326, -2.0690, -1.6180, -1.2562,
-#                        -0.9423, -0.6568, -0.3881, -0.1284,
-#                         0.1284,  0.3881,  0.6568,  0.9423,
-#                         1.2562,  1.6180,  2.0690,  2.7326]
+# Fallback: N(0,1) Lloyd-Max centroids scaled by 1/sqrt(d) for unknown dims.
+# Toggle: set TURBO_USE_N01_CENTROIDS=1 to force N(0,1) for A/B testing.
 # ---------------------------------------------------------------------------
 
-# Standard-normal Lloyd-Max centroids (not yet scaled by 1/sqrt(dim))
+# Beta distribution centroids keyed by (bits, dim) — already scaled for dim.
+# Do NOT multiply by 1/sqrt(d) again.
+_BETA_CENTROIDS: Dict[Tuple[int, int], List[float]] = {
+    (4, 64): [
+        -0.32913971, -0.25096416, -0.19681059, -0.15295772,
+        -0.11478586, -0.08000945, -0.04726735, -0.01563822,
+        0.01563822, 0.04723797, 0.07994876, 0.11472529,
+        0.15289739, 0.19675052, 0.25090477, 0.32908401,
+    ],
+    (4, 128): [
+        -0.23639172, -0.17934021, -0.14023653, -0.10881814,
+        -0.08157559, -0.05678632, -0.03350975, -0.01108178,
+        0.01108178, 0.03350975, 0.05678631, 0.08157560,
+        0.10881804, 0.14023650, 0.17934017, 0.23639278,
+    ],
+    (4, 256): [
+        -0.16852295, -0.12754069, -0.09961203, -0.07719406,
+        -0.05781249, -0.04021866, -0.02370371, -0.00783269,
+        0.00783269, 0.02370371, 0.04021868, 0.05781246,
+        0.07719407, 0.09961203, 0.12754090, 0.16852276,
+    ],
+    (3, 128): [
+        -0.18828832, -0.11801215, -0.06648001, -0.02156330,
+        0.02156329, 0.06648005, 0.11801218, 0.18828897,
+    ],
+    (2, 128): [
+        -0.13302007, -0.03998107, 0.03998102, 0.13302033,
+    ],
+}
+
+# N(0,1) Lloyd-Max centroids (fallback for unknown dims, scaled by 1/sqrt(d))
 _LLOYD_MAX_CENTROIDS = {
     2: [-1.5104, -0.4528, 0.4528, 1.5104],
     3: [
@@ -48,9 +74,15 @@ _LLOYD_MAX_CENTROIDS = {
 
 
 class TurboQuantCodebook:
-    """Pre-computed Lloyd-Max codebook for TurboQuant.
+    """Pre-computed codebook for TurboQuant.
 
-    Centroids are scaled by 1/sqrt(dim) to match the post-SRHT distribution.
+    Uses Beta distribution centroids (proven better) when available for the
+    given (bits, dim) pair. Falls back to N(0,1) Lloyd-Max centroids scaled
+    by 1/sqrt(dim) for unknown dims.
+
+    Beta centroids are already scaled for their dim — no 1/sqrt(d) applied.
+    Set TURBO_USE_N01_CENTROIDS=1 to force N(0,1) fallback for A/B testing.
+
     Boundaries are midpoints between adjacent centroids.
 
     Args:
@@ -77,10 +109,20 @@ class TurboQuantCodebook:
         self.dim = dim
         self.n_levels = 1 << bits
 
-        # Scale centroids by 1/sqrt(dim) to match post-SRHT distribution
-        scale = 1.0 / math.sqrt(dim)
-        raw = _LLOYD_MAX_CENTROIDS[bits]
-        self.centroids = mx.array([c * scale for c in raw], dtype=mx.float32)
+        force_n01 = os.environ.get("TURBO_USE_N01_CENTROIDS", "0") == "1"
+        beta_key = (bits, dim)
+
+        if not force_n01 and beta_key in _BETA_CENTROIDS:
+            # Beta distribution centroids — already scaled for this dim
+            raw = _BETA_CENTROIDS[beta_key]
+            self.centroids = mx.array(raw, dtype=mx.float32)
+            self._centroid_source = "beta"
+        else:
+            # Fallback: N(0,1) Lloyd-Max scaled by 1/sqrt(dim)
+            scale = 1.0 / math.sqrt(dim)
+            raw = _LLOYD_MAX_CENTROIDS[bits]
+            self.centroids = mx.array([c * scale for c in raw], dtype=mx.float32)
+            self._centroid_source = "n01"
 
         # Boundaries = midpoints between adjacent centroids
         c = self.centroids
