@@ -859,6 +859,13 @@ class TurboKVCache:
         # FP values when v_bits <= 0 (no compression)
         self._fp_values: Optional[mx.array] = None
 
+        # Cached decoded FP16 arrays — avoids re-decoding entire packed storage
+        # every step. Only the newly added token(s) get decoded and concatenated.
+        # This matches the llama.cpp approach: compressed storage is source of
+        # truth for memory savings, decoded FP16 window is for fast attention.
+        self._decoded_keys: Optional[mx.array] = None
+        self._decoded_values: Optional[mx.array] = None
+
         self._is_compressed = False
         self._dim: Optional[int] = None
         self.offset = 0
@@ -888,12 +895,23 @@ class TurboKVCache:
             self._packed_keys, self._key_norms = turbo_encode(
                 self._raw_keys, bits=self.k_bits, seed=self.seed,
             )
+            # Decode once to seed the FP16 cache — subsequent steps only
+            # decode the new token and concatenate (O(1) not O(n))
+            self._decoded_keys = turbo_decode(
+                self._packed_keys, self._key_norms, self._dim,
+                bits=self.k_bits, seed=self.seed,
+            )
         else:
             self._fp_keys = self._raw_keys
 
         if self.compress_values:
             self._packed_values, self._value_norms = turbo_encode(
                 self._raw_values, bits=self.v_bits, seed=self.seed,
+            )
+            # Same: decode once, then incremental
+            self._decoded_values = turbo_decode(
+                self._packed_values, self._value_norms, self._dim,
+                bits=self.v_bits, seed=self.seed,
             )
         else:
             self._fp_values = self._raw_values
@@ -967,10 +985,18 @@ class TurboKVCache:
             else:
                 self._packed_keys = new_pk
                 self._key_norms = new_kn
-            all_keys = turbo_decode(
-                self._packed_keys, self._key_norms, dim,
-                bits=self.k_bits, seed=self.seed,
+            # Incremental decode: only decode the new token(s), concat with
+            # cached FP16. Avoids O(n) full-cache decode every step.
+            new_decoded_k = turbo_decode(
+                new_pk, new_kn, dim, bits=self.k_bits, seed=self.seed,
             )
+            if self._decoded_keys is not None:
+                self._decoded_keys = mx.concatenate(
+                    [self._decoded_keys, new_decoded_k], axis=2,
+                )
+            else:
+                self._decoded_keys = new_decoded_k
+            all_keys = self._decoded_keys
         else:
             if self._fp_keys is not None:
                 self._fp_keys = mx.concatenate([self._fp_keys, keys], axis=2)
@@ -991,10 +1017,17 @@ class TurboKVCache:
             else:
                 self._packed_values = new_pv
                 self._value_norms = new_vn
-            all_values = turbo_decode(
-                self._packed_values, self._value_norms, dim,
-                bits=self.v_bits, seed=self.seed,
+            # Incremental decode: only decode the new token(s)
+            new_decoded_v = turbo_decode(
+                new_pv, new_vn, dim, bits=self.v_bits, seed=self.seed,
             )
+            if self._decoded_values is not None:
+                self._decoded_values = mx.concatenate(
+                    [self._decoded_values, new_decoded_v], axis=2,
+                )
+            else:
+                self._decoded_values = new_decoded_v
+            all_values = self._decoded_values
         else:
             if self._fp_values is not None:
                 self._fp_values = mx.concatenate([self._fp_values, values], axis=2)
@@ -1015,14 +1048,18 @@ class TurboKVCache:
                 return self._raw_keys, self._raw_values
             return []
 
-        # After compression, return all stored tensors
+        # After compression, return all stored tensors (including decoded FP16 cache)
         parts = []
         if self._packed_keys is not None:
             parts.extend([self._packed_keys, self._key_norms])
+        if self._decoded_keys is not None:
+            parts.append(self._decoded_keys)
         if self._fp_keys is not None:
             parts.append(self._fp_keys)
         if self._packed_values is not None:
             parts.extend([self._packed_values, self._value_norms])
+        if self._decoded_values is not None:
+            parts.append(self._decoded_values)
         if self._fp_values is not None:
             parts.append(self._fp_values)
         return parts if parts else []
@@ -1056,6 +1093,12 @@ class TurboKVCache:
             if n > 0:
                 self._raw_keys = self._raw_keys[..., :-n, :]
                 self._raw_values = self._raw_values[..., :-n, :]
+        if n > 0:
+            # Trim decoded FP16 caches to stay in sync
+            if self._decoded_keys is not None:
+                self._decoded_keys = self._decoded_keys[..., :-n, :]
+            if self._decoded_values is not None:
+                self._decoded_values = self._decoded_values[..., :-n, :]
         return n
 
     def make_mask(self, N, return_array=False, window_size=None):
@@ -1081,6 +1124,7 @@ class TurboKVCache:
             self._raw_keys, self._raw_values,
             self._packed_keys, self._key_norms,
             self._packed_values, self._value_norms,
+            self._decoded_keys, self._decoded_values,
             self._fp_keys, self._fp_values,
         ]:
             if arr is not None:
