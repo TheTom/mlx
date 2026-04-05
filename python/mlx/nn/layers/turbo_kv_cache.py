@@ -1967,13 +1967,13 @@ class TurboKVCache:
             )
             # Decode once to seed the FP16 cache — subsequent steps only
             # decode the new token and concatenate (O(1) not O(n)).
-            # Skip when fused_attention=True: the fused kernel reads packed
-            # data directly, so decoded FP16 buffers waste memory.
-            if not self._fused_attention:
-                self._decoded_keys = turbo_decode(
-                    self._packed_keys, self._key_norms, self._dim,
-                    bits=self.k_bits, seed=self.seed,
-                )
+            # Always seed decoded cache so update_and_fetch works with
+            # standard SDPA. The fused kernel (attention() method) reads
+            # packed data directly and ignores decoded buffers.
+            self._decoded_keys = turbo_decode(
+                self._packed_keys, self._key_norms, self._dim,
+                bits=self.k_bits, seed=self.seed,
+            )
         else:
             self._fp_keys = self._raw_keys
 
@@ -1982,12 +1982,11 @@ class TurboKVCache:
                 self._raw_values, bits=self.v_bits, seed=self.seed,
             )
             # Same: decode once, then incremental.
-            # Skip when fused_attention=True.
-            if not self._fused_attention:
-                self._decoded_values = turbo_decode(
-                    self._packed_values, self._value_norms, self._dim,
-                    bits=self.v_bits, seed=self.seed,
-                )
+            # Always seed decoded cache for update_and_fetch compatibility.
+            self._decoded_values = turbo_decode(
+                self._packed_values, self._value_norms, self._dim,
+                bits=self.v_bits, seed=self.seed,
+            )
         else:
             self._fp_values = self._raw_values
 
