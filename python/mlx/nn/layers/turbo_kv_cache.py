@@ -150,7 +150,7 @@ def _sign_flip_vector(dim: int, seed: int) -> mx.array:
     """Generate a deterministic {-1, +1} sign vector from seed.
 
     Uses mx.random with a fixed key so the same seed always produces
-    the same sign pattern. This is the 'S' in SRHT = S·H·D.
+    the same sign pattern. This is the 'S1' (pre-WHT) in the full SRHT = S2·H·S1.
 
     Args:
         dim: Length of the sign vector.
@@ -161,6 +161,28 @@ def _sign_flip_vector(dim: int, seed: int) -> mx.array:
     """
     key = mx.array([seed, 0], dtype=mx.uint32)
     # Uniform [0,1) → threshold at 0.5 → {-1, +1}
+    r = mx.random.uniform(shape=(dim,), key=key)
+    signs = mx.where(r < 0.5, mx.array(-1.0), mx.array(1.0))
+    return signs
+
+
+def _sign_flip_vector2(dim: int, seed: int) -> mx.array:
+    """Generate a SECOND independent {-1, +1} sign vector for post-WHT flip.
+
+    llama.cpp SRHT uses TWO sign arrays: x_rot = signs2 * WHT(signs1 * x) / sqrt(n).
+    The post-WHT sign flip (signs2) breaks any remaining structure after the
+    Hadamard transform, providing better decorrelation for quantization.
+
+    Uses seed + 1000 to generate an independent sign pattern from _sign_flip_vector.
+
+    Args:
+        dim: Length of the sign vector.
+        seed: Random seed (will be offset by +1000 for independence).
+
+    Returns:
+        mx.array of shape (dim,) with values in {-1, +1}.
+    """
+    key = mx.array([seed + 1000, 0], dtype=mx.uint32)
     r = mx.random.uniform(shape=(dim,), key=key)
     signs = mx.where(r < 0.5, mx.array(-1.0), mx.array(1.0))
     return signs
@@ -198,7 +220,8 @@ def _make_compiled_encode(bits: int, dim: int, seed: int):
         Compiled callable that takes x and returns (packed, norms).
     """
     cb = _get_codebook(bits, dim)
-    signs = _sign_flip_vector(dim, seed)
+    signs1 = _sign_flip_vector(dim, seed)
+    signs2 = _sign_flip_vector2(dim, seed)
     boundaries = cb.boundaries
 
     def _encode_inner(x):
@@ -207,10 +230,10 @@ def _make_compiled_encode(bits: int, dim: int, seed: int):
         safe_norms = mx.maximum(norms, mx.array(1e-10))
         x_unit = x / safe_norms
 
-        # 2. Sign flip + WHT (fused: single element-wise multiply before WHT)
-        # Since sign_flip is just element-wise ±1 multiply, MLX's compiler
-        # can fuse this with the hadamard_transform input read.
-        x_rotated = mx.hadamard_transform(x_unit * signs)
+        # 2. Dual sign flip + WHT: x_rot = signs2 * WHT(signs1 * x) / sqrt(n)
+        # llama.cpp uses two sign arrays for better decorrelation.
+        # signs1 (pre-WHT) randomizes input, signs2 (post-WHT) breaks remaining structure.
+        x_rotated = mx.hadamard_transform(x_unit * signs1) * signs2
 
         # 3. Boundary quantize
         indices = mx.sum(
@@ -314,9 +337,12 @@ def turbo_encode_uncompiled(
     safe_norms = mx.maximum(norms, mx.array(1e-10))
     x_unit = x / safe_norms
 
-    # 2. Apply random sign flip (element-wise multiply by ±1)
-    signs = _sign_flip_vector(dim, seed)
-    x_flipped = x_unit * signs
+    # 2. Apply dual sign flip + WHT: x_rot = signs2 * WHT(signs1 * x) / sqrt(n)
+    # llama.cpp SRHT uses TWO sign arrays for better decorrelation.
+    # signs1 (pre-WHT) randomizes input, signs2 (post-WHT) breaks remaining structure.
+    signs1 = _sign_flip_vector(dim, seed)
+    signs2 = _sign_flip_vector2(dim, seed)
+    x_flipped = x_unit * signs1
 
     # 3. Apply Walsh-Hadamard Transform
     # mx.hadamard_transform default scale is 1/sqrt(N), giving us orthonormal WHT
@@ -331,7 +357,7 @@ def turbo_encode_uncompiled(
     # WHT only decorrelates within each 32-element block, not across the full
     # head_dim. For MLX, this would need profiling — Metal's SIMD may not have
     # the same 32-wide sweet spot as ARM NEON in llama.cpp.
-    x_rotated = mx.hadamard_transform(x_flipped)
+    x_rotated = mx.hadamard_transform(x_flipped) * signs2
 
     # 4. Boundary quantize → indices (pure centroid, NO residual correction)
     #
@@ -409,15 +435,17 @@ def turbo_decode(
     centroids = cb.centroids  # (n_levels,)
     x_rotated = centroids[indices]  # (..., dim)
 
-    # 3. Inverse WHT (Hadamard is its own inverse up to scaling)
-    # Since we used orthonormal (scale=1/sqrt(N)), applying it again gives identity
+    # 3. Inverse dual sign flip + WHT
+    # Encode was: x_rot = signs2 * WHT(signs1 * x)
+    # Decode is:  x = signs1 * WHT(signs2 * x_rot)  (signs are self-inverse)
     # NOTE: If block_size optimization is added to encode (see TODO there),
     # the same reshape→transform→reshape must be applied here in reverse.
-    x_flipped = mx.hadamard_transform(x_rotated)
+    signs1 = _sign_flip_vector(dim, seed)
+    signs2 = _sign_flip_vector2(dim, seed)
+    x_flipped = mx.hadamard_transform(x_rotated * signs2)
 
     # 4. Inverse sign flip (signs are their own inverse: s * s = 1)
-    signs = _sign_flip_vector(dim, seed)
-    x_unit = x_flipped * signs
+    x_unit = x_flipped * signs1
 
     # 5. Scale by norms
     x_reconstructed = x_unit * norms
@@ -461,7 +489,8 @@ _TURBO_ENCODE_SOURCE_4BIT = """
     //
     // Inputs:
     //   x:          [num_vectors, dim]     — input vectors (float32)
-    //   signs:      [dim]                  — sign flip array {-1, +1}
+    //   signs1:     [dim]                  — pre-WHT sign flip array {-1, +1}
+    //   signs2:     [dim]                  — post-WHT sign flip array {-1, +1}
     //   boundaries: [15]                   — quantization boundaries (4-bit: 15)
     //   params:     [3]                    — {dim, num_vectors, packed_dim}
     //
@@ -510,8 +539,8 @@ _TURBO_ENCODE_SOURCE_4BIT = """
     // 3. Normalize to unit sphere
     val = val / norm;
 
-    // 4. Sign flip
-    val = val * signs[tid];
+    // 4. Pre-WHT sign flip (signs1)
+    val = val * signs1[tid];
 
     // 5. WHT butterfly (in-place via shared memory, double-buffered reads)
     //    Hadamard with 1/sqrt(dim) normalization (orthonormal)
@@ -540,9 +569,9 @@ _TURBO_ENCODE_SOURCE_4BIT = """
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Apply 1/sqrt(dim) normalization
+    // Apply 1/sqrt(dim) normalization + post-WHT sign flip (signs2)
     float inv_sqrt_dim = rsqrt((float)dim);
-    float rotated = shared_data[tid] * inv_sqrt_dim;
+    float rotated = shared_data[tid] * inv_sqrt_dim * signs2[tid];
 
     // 6. Boundary quantize — 4-bit has 15 boundaries
     uint idx = boundary_quantize(rotated, boundaries, 15);
@@ -599,7 +628,8 @@ _TURBO_DECODE_SOURCE_4BIT = """
     //   packed_in:   [num_vectors, packed_dim] — packed 4-bit indices (uint32)
     //   norms_in:    [num_vectors]             — L2 norms
     //   centroids:   [16]                      — centroid lookup table
-    //   signs:       [dim]                     — sign flip array {-1, +1}
+    //   signs1:      [dim]                     — pre-WHT sign flip array {-1, +1}
+    //   signs2:      [dim]                     — post-WHT sign flip array {-1, +1}
     //   params:      [3]                       — {dim, num_vectors, packed_dim}
     //
     // Outputs:
@@ -622,8 +652,8 @@ _TURBO_DECODE_SOURCE_4BIT = """
     uint packed_word = packed_in[vec_idx * packed_dim + word_idx];
     uint idx = (packed_word >> (pos_in_word * 4)) & 0xF;
 
-    // 2. Codebook lookup
-    float val = centroids[idx];
+    // 2. Codebook lookup + pre-inverse-WHT sign flip (signs2)
+    float val = centroids[idx] * signs2[tid];
 
     // 3. Inverse WHT butterfly (Hadamard is self-inverse up to scaling)
     //    Double-buffered: read pair → barrier → write result → barrier
@@ -651,8 +681,8 @@ _TURBO_DECODE_SOURCE_4BIT = """
     float inv_sqrt_dim = rsqrt((float)dim);
     float rotated = shared_data[tid] * inv_sqrt_dim;
 
-    // 4. Inverse sign flip (signs are self-inverse)
-    rotated = rotated * signs[tid];
+    // 4. Inverse sign flip — signs1 (post-inverse-WHT, undoes the pre-WHT flip)
+    rotated = rotated * signs1[tid];
 
     // 5. Scale by norm
     float norm = norms_in[vec_idx];
@@ -681,7 +711,7 @@ def _get_turbo_encode_kernel(bits: int):
 
     kernel = mx.fast.metal_kernel(
         name=f"turbo_encode_{bits}bit",
-        input_names=["x", "signs", "boundaries", "params"],
+        input_names=["x", "signs1", "signs2", "boundaries", "params"],
         output_names=["packed_out", "norms_out"],
         header=_TURBO_ENCODE_HEADER,
         source=_TURBO_ENCODE_SOURCE_4BIT,
@@ -714,7 +744,7 @@ def _get_turbo_decode_kernel(bits: int):
 
     kernel = mx.fast.metal_kernel(
         name=f"turbo_decode_{bits}bit",
-        input_names=["packed_in", "norms_in", "centroids", "signs", "params"],
+        input_names=["packed_in", "norms_in", "centroids", "signs1", "signs2", "params"],
         output_names=["x_out"],
         header=_TURBO_DECODE_HEADER,
         source=_TURBO_DECODE_SOURCE_4BIT,
@@ -730,11 +760,14 @@ def _get_turbo_decode_kernel(bits: int):
 _sign_cache: Dict[Tuple[int, int], mx.array] = {}
 
 
-def _get_signs(dim: int, seed: int) -> mx.array:
-    """Get cached sign flip vector."""
+def _get_signs(dim: int, seed: int) -> Tuple[mx.array, mx.array]:
+    """Get cached dual sign flip vectors (signs1, signs2)."""
     key = (dim, seed)
     if key not in _sign_cache:
-        _sign_cache[key] = _sign_flip_vector(dim, seed)
+        _sign_cache[key] = (
+            _sign_flip_vector(dim, seed),
+            _sign_flip_vector2(dim, seed),
+        )
     return _sign_cache[key]
 
 
@@ -773,7 +806,7 @@ def turbo_encode_fused(
 
     kernel = _get_turbo_encode_kernel(bits)
     cb = _get_codebook(bits, dim)
-    signs = _get_signs(dim, seed)
+    signs1, signs2 = _get_signs(dim, seed)
 
     # Flatten to (num_vectors, dim)
     leading_shape = x.shape[:-1]
@@ -787,7 +820,7 @@ def turbo_encode_fused(
     params = mx.array([dim, num_vectors, packed_dim], dtype=mx.uint32)
 
     outputs = kernel(
-        inputs=[x_flat, signs, cb.boundaries, params],
+        inputs=[x_flat, signs1, signs2, cb.boundaries, params],
         output_shapes=[
             (num_vectors, packed_dim),  # packed_out
             (num_vectors,),             # norms_out
@@ -839,7 +872,7 @@ def turbo_decode_fused(
 
     kernel = _get_turbo_decode_kernel(bits)
     cb = _get_codebook(bits, dim)
-    signs = _get_signs(dim, seed)
+    signs1, signs2 = _get_signs(dim, seed)
 
     packed_dim = dim // 8
     leading_shape = packed_indices.shape[:-1]
@@ -854,7 +887,7 @@ def turbo_decode_fused(
     params = mx.array([dim, num_vectors, packed_dim], dtype=mx.uint32)
 
     outputs = kernel(
-        inputs=[packed_flat, norms_flat, cb.centroids, signs, params],
+        inputs=[packed_flat, norms_flat, cb.centroids, signs1, signs2, params],
         output_shapes=[
             (num_vectors, dim),  # x_out
         ],
@@ -1092,13 +1125,13 @@ def turbo_attention(
 # Fused compressed-domain attention (Metal kernel — no FP16 materialization)
 # ---------------------------------------------------------------------------
 
-# The Metal kernel operates in the WHT (rotated) domain:
-#   1. Python pre-rotates Q: Q_rot = WHT(Q * signs)          — once per query
+# The Metal kernel operates in the WHT (rotated) domain with dual signs:
+#   1. Python pre-rotates Q: Q_rot = signs2 * WHT(signs1 * Q)   — once per query
 #   2. Kernel: for each KV token, unpack indices → centroid lookup → dot product
 #      with Q_rot → softmax → centroid lookup for V → weighted sum
-#   3. Python post-rotates output: out = signs * WHT(accum)   — once per output
+#   3. Python post-rotates output: out = signs1 * WHT(signs2 * accum)   — once
 #
-# This avoids materializing FP16 K/V entirely. The WHT and sign-flip are
+# This avoids materializing FP16 K/V entirely. The dual WHT and sign-flips are
 # linear operators applied once to Q and once to the output, NOT per-KV-token.
 # Memory bandwidth: reads packed uint32 indices + norms (4-bit: 1/8th of FP16).
 # Compute: centroid lookup is a 16-entry table lookup, trivially fast.
@@ -1696,14 +1729,15 @@ def turbo_fused_attention(
 
     B, n_heads, T_kv, packed_dim = packed_keys.shape
 
-    # --- Step 1: Pre-rotate queries into WHT domain ---
-    # Q_rot = WHT(Q * signs)
+    # --- Step 1: Pre-rotate queries into WHT domain (dual signs) ---
+    # Q_rot = signs2 * WHT(signs1 * Q)
     # This transforms the query so that dot products with centroid vectors in
     # the WHT domain give the same result as dot products with decoded K in
     # the original domain. (WHT is orthonormal → preserves inner products.)
-    signs = _sign_flip_vector(dim, seed)
-    q_flipped = queries * signs                 # (B, n_heads, 1, dim)
-    q_rot = mx.hadamard_transform(q_flipped)    # (B, n_heads, 1, dim)
+    signs1 = _sign_flip_vector(dim, seed)
+    signs2 = _sign_flip_vector2(dim, seed)
+    q_flipped = queries * signs1                # (B, n_heads, 1, dim)
+    q_rot = mx.hadamard_transform(q_flipped) * signs2  # (B, n_heads, 1, dim)
     q_rot = q_rot.astype(mx.float32)
 
     # --- Step 2: Flatten norms for kernel (remove trailing dim of 1) ---
@@ -1758,12 +1792,12 @@ def turbo_fused_attention(
 
     out_rot = outputs[0]  # (n_bh, dim) — in WHT domain
 
-    # --- Step 5: Inverse transform back to original domain ---
-    # output = signs * WHT(out_rot)
+    # --- Step 5: Inverse transform back to original domain (dual signs) ---
+    # output = signs1 * WHT(signs2 * out_rot)
     # (WHT is its own inverse for orthonormal normalization)
     out_rot = out_rot.reshape(B, n_heads, 1, dim)
-    out_transformed = mx.hadamard_transform(out_rot)
-    output = out_transformed * signs
+    out_transformed = mx.hadamard_transform(out_rot * signs2)
+    output = out_transformed * signs1
 
     return output.astype(queries.dtype)
 
@@ -1804,10 +1838,11 @@ def _turbo_fused_attention_nr0_2(
 
     B, n_heads, T_kv, packed_dim = packed_keys.shape
 
-    # Pre-rotate both queries into WHT domain
-    signs = _sign_flip_vector(dim, seed)
-    q_flipped = queries * signs                 # (B, n_heads, 2, dim)
-    q_rot = mx.hadamard_transform(q_flipped)    # (B, n_heads, 2, dim)
+    # Pre-rotate both queries into WHT domain (dual signs)
+    signs1 = _sign_flip_vector(dim, seed)
+    signs2 = _sign_flip_vector2(dim, seed)
+    q_flipped = queries * signs1                # (B, n_heads, 2, dim)
+    q_rot = mx.hadamard_transform(q_flipped) * signs2  # (B, n_heads, 2, dim)
     q_rot = q_rot.astype(mx.float32)
 
     # Flatten norms
@@ -1856,10 +1891,10 @@ def _turbo_fused_attention_nr0_2(
 
     out_rot = outputs[0]  # (n_bh, 2, dim)
 
-    # Inverse transform back to original domain
+    # Inverse transform back to original domain (dual signs)
     out_rot = out_rot.reshape(B, n_heads, 2, dim)
-    out_transformed = mx.hadamard_transform(out_rot)
-    output = out_transformed * signs
+    out_transformed = mx.hadamard_transform(out_rot * signs2)
+    output = out_transformed * signs1
 
     return output.astype(queries.dtype)
 
