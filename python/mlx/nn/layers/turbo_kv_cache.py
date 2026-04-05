@@ -142,6 +142,15 @@ def _get_codebook(bits: int, dim: int) -> TurboQuantCodebook:
 
 
 # ---------------------------------------------------------------------------
+# TODO: InnerQ per-channel scale precision correction (Item 7)
+# llama.cpp's CUDA backend has turbo-innerq.cuh: per-channel equalization
+# that calibrates K² statistics over tokens and applies scale correction
+# before quantization. Initialized to identity (all 1.0), activated via
+# TURBO_INNERQ_TOKENS env. This is CUDA-only in llama.cpp (not in their
+# Metal path either), so not applicable to MLX currently. If MLX ever gets
+# a CUDA backend, this could be ported. For Metal, the Beta-distribution
+# centroids already handle the distribution well.
+# ---------------------------------------------------------------------------
 # Sign-flip PRNG — deterministic random signs from seed
 # ---------------------------------------------------------------------------
 
