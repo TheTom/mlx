@@ -356,6 +356,43 @@ def _unpack_indices(packed: mx.array, bits: int, dim: int) -> mx.array:
 
 
 # ---------------------------------------------------------------------------
+# Sparse attention masking (sparse-v-dequant.md)
+# ---------------------------------------------------------------------------
+
+
+def sparse_attention_mask(
+    weights: mx.array,
+    threshold: float = 1e-6,
+) -> mx.array:
+    """Create a boolean mask that zeros out near-zero attention weights.
+
+    After softmax, many attention positions have negligible weight (< 1e-6).
+    Zeroing these before the V matmul lets MLX potentially skip those lanes,
+    saving compute proportional to sparsity.
+
+    From sparse-v-dequant.md: on Apple Silicon, skipping dequant for near-zero
+    weights saved meaningful compute. This mask is the first step — it prevents
+    near-zero weights from contributing to the V weighted sum. A full sparse
+    implementation would also skip the V dequant itself (requires fused kernel).
+
+    Args:
+        weights: Post-softmax attention weights, shape (..., q_len, kv_len).
+        threshold: Weights below this value are masked out. Default: 1e-6.
+
+    Returns:
+        Boolean mask of same shape as weights (1.0 where weight >= threshold,
+        0.0 where weight < threshold). Multiply with weights before V matmul.
+
+    Example:
+        >>> weights = mx.softmax(scores, axis=-1)
+        >>> mask = sparse_attention_mask(weights, threshold=1e-6)
+        >>> weights = weights * mask  # zero out negligible positions
+        >>> output = weights @ values  # MLX can skip zeroed lanes
+    """
+    return (weights >= threshold).astype(weights.dtype)
+
+
+# ---------------------------------------------------------------------------
 # TurboQuant attention (decode-then-matmul, not fused)
 # ---------------------------------------------------------------------------
 
@@ -428,7 +465,22 @@ def turbo_attention(
 
     weights = mx.softmax(scores, axis=-1)
 
+    # Apply sparse attention mask to skip near-zero V contributions
+    # See: sparse-v-dequant.md — many post-softmax weights are near-zero,
+    # making those V dequant+matmul ops wasted compute. By zeroing them
+    # out before the matmul, MLX can potentially skip those lanes entirely.
+    sparse_mask = sparse_attention_mask(weights)
+    weights = weights * sparse_mask
+
     # Weighted sum of values
+    # TODO: Full sparse V optimization — skip dequant entirely for masked
+    # positions. The current decode-then-matmul approach materializes all V
+    # tokens to FP16 before the matmul. True sparse dequant would only decode
+    # the V tokens with significant attention weight, saving both compute and
+    # memory bandwidth. This requires a fused kernel that checks attention
+    # weights BEFORE dequanting each V token. Expected benefit on Apple Silicon:
+    # 15-30% decode speedup at long context (>4K tokens) where most attention
+    # mass concentrates on a few positions. (sparse-v-dequant.md)
     output = weights @ values
 
     return output
