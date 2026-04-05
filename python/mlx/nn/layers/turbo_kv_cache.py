@@ -378,6 +378,16 @@ def turbo_attention(
     then do standard scaled dot-product attention. A fused Metal kernel
     version will come later for better performance.
 
+    **Asymmetric K/V quantization** (recommended):
+
+    K precision dominates output quality because errors in K are amplified
+    through the softmax exponential — small errors in dot products become
+    large errors in attention weights. V errors are merely averaged.
+
+    Recommended config: K stays at FP16, V at turbo4 (``key_bits=0, bits=4``
+    in TurboQuantKVCache, aka "turbo0v4"). Symmetric turbo3/turbo3 works
+    but asymmetric gives strictly better quality for the same memory budget.
+
     Args:
         queries: Query tensor, shape (batch, heads, q_len, dim).
         packed_keys: Packed key indices from turbo_encode, shape (batch, heads, kv_len, packed_dim).
@@ -440,18 +450,32 @@ class TurboQuantKVCache(Module):
     - Asymmetric K/V: keys can stay FP16 while values are compressed
     - Configurable bit-width: 2, 3, or 4 bits per element
 
+    **Quality guidance** (from empirical testing):
+
+    K precision dominates quality via softmax amplification — small K errors
+    become large attention weight errors through the exponential. V errors
+    are merely averaged across tokens.
+
+    - Best quality: ``key_bits=0, bits=4`` (K=FP16, V=turbo4 aka "turbo0v4")
+    - Good balance: ``key_bits=4, bits=4`` (symmetric turbo4)
+    - Aggressive: ``key_bits=0, bits=3`` (K=FP16, V=turbo3)
+
+    Boundary layers (first 2 + last 2 by default) stay at full precision
+    as they carry disproportionate signal (confirmed by dhawalc's
+    TurboQuantDC independent validation).
+
     Args:
         bits (int): Quantization bit-width for values. Default: 4.
         key_bits (Optional[int]): Bit-width for keys. None = same as bits.
             Set to 0 or -1 to keep keys at full precision (asymmetric mode).
         seed (int): SRHT random seed. Default: 42.
         boundary_layers (int): Number of layers at start/end to keep at full
-            precision. Default: 2.
+            precision. Default: 2. Override with TURBO_BOUNDARY_LAYERS env var.
         layer_idx (Optional[int]): This cache's layer index (for boundary protection).
         num_layers (Optional[int]): Total number of layers (for boundary protection).
 
     Example:
-        >>> cache = TurboQuantKVCache(bits=4, key_bits=0)  # V=4bit, K=FP
+        >>> cache = TurboQuantKVCache(bits=4, key_bits=0)  # V=4bit, K=FP (recommended)
         >>> # During model forward pass:
         >>> keys, values = cache.update_and_fetch(keys, values)
 
