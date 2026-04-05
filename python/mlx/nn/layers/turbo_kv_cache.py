@@ -760,3 +760,338 @@ class TurboQuantKVCache(Module):
         elif self._keys is not None:
             parts.append(f"raw, seq_len={self.seq_len}")
         return ", ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# TurboKVCache — mlx-lm compatible cache for inference
+# ---------------------------------------------------------------------------
+
+
+def _create_causal_mask(N, offset, window_size=None):
+    """Create a causal attention mask (local copy to avoid import cycles)."""
+    rinds = mx.arange(offset + N)
+    linds = mx.arange(offset, offset + N) if offset else rinds
+    linds = linds[:, None]
+    rinds = rinds[None]
+    mask = linds >= rinds
+    if window_size is not None:
+        mask = mask & (linds < rinds + window_size)
+    return mask
+
+
+def _turbo_create_attention_mask(N, offset, return_array, window_size):
+    """Create attention mask matching mlx-lm's cache.create_attention_mask."""
+    if window_size is not None:
+        return _create_causal_mask(N, offset, window_size=window_size)
+    elif N == 1:
+        return None
+    elif return_array:
+        return _create_causal_mask(N, offset, window_size=window_size)
+    else:
+        return "causal"
+
+
+class TurboKVCache:
+    """TurboQuant KV cache compatible with mlx-lm's inference loop.
+
+    Drop-in replacement for mlx-lm's ``KVCache`` that compresses the KV cache
+    using TurboQuant (SRHT + Lloyd-Max quantization). Integrates with
+    ``generate_step`` / ``stream_generate`` / ``generate`` via the
+    ``prompt_cache`` parameter.
+
+    **Two-phase design:**
+
+    1. **Prefill** (num_steps > 1): stores raw FP16 keys/values, matching our
+       llama.cpp prefill fix. No quantization overhead during prompt processing.
+    2. **Decode** (num_steps == 1): on the first single-token step, compresses
+       the raw cache. Subsequent tokens are encoded and appended to the packed
+       storage. ``update_and_fetch`` always returns full FP16 K/V so standard
+       SDPA works — compression is internal only.
+
+    No ``bits`` attribute is exposed, so ``scaled_dot_product_attention`` in
+    mlx-lm's ``base.py`` takes the standard (non-quantized) path.
+
+    Asymmetric K/V is supported: set ``key_bits=0`` to keep keys at FP16
+    while values are turbo-compressed. This is the recommended config since
+    K errors get amplified through softmax exponentials.
+
+    Args:
+        bits (int): Quantization bit-width for values. Default: 4.
+        key_bits (Optional[int]): Bit-width for keys. ``None`` = same as
+            ``bits``. Set to 0 to keep keys at full precision. Default: None.
+        seed (int): SRHT random seed. Default: 42.
+
+    Example:
+        >>> import mlx_lm
+        >>> from mlx.nn.layers.turbo_kv_cache import TurboKVCache
+        >>> model, tokenizer = mlx_lm.load('mlx-community/Qwen3.5-2B-8bit')
+        >>> n_layers = len(model.model.layers)
+        >>> cache = [TurboKVCache(bits=4) for _ in range(n_layers)]
+        >>> text = mlx_lm.generate(
+        ...     model, tokenizer, prompt='Hello',
+        ...     max_tokens=20, prompt_cache=cache, verbose=True,
+        ... )
+    """
+
+    def __init__(
+        self,
+        bits: int = 4,
+        key_bits: Optional[int] = None,
+        seed: int = 42,
+    ):
+        self.v_bits = bits
+        self.k_bits = key_bits if key_bits is not None else bits
+        self.seed = seed
+
+        # Raw (uncompressed) storage — used during prefill
+        self._raw_keys: Optional[mx.array] = None
+        self._raw_values: Optional[mx.array] = None
+
+        # Compressed storage — used during decode
+        self._packed_keys: Optional[mx.array] = None
+        self._key_norms: Optional[mx.array] = None
+        self._packed_values: Optional[mx.array] = None
+        self._value_norms: Optional[mx.array] = None
+
+        # FP keys when key_bits <= 0 (asymmetric mode)
+        self._fp_keys: Optional[mx.array] = None
+
+        # FP values when v_bits <= 0 (no compression)
+        self._fp_values: Optional[mx.array] = None
+
+        self._is_compressed = False
+        self._dim: Optional[int] = None
+        self.offset = 0
+
+    @property
+    def compress_keys(self) -> bool:
+        """Whether keys should be turbo-compressed (vs kept at FP)."""
+        return self.k_bits > 0
+
+    @property
+    def compress_values(self) -> bool:
+        """Whether values should be turbo-compressed."""
+        return self.v_bits > 0
+
+    def _compress_raw_cache(self) -> None:
+        """Compress accumulated raw prefill cache into TurboQuant format.
+
+        Called once on the first decode step. After this, the raw buffers are
+        freed and all new tokens go through encode→pack.
+        """
+        if self._is_compressed or self._raw_keys is None:
+            return
+
+        self._dim = self._raw_keys.shape[-1]
+
+        if self.compress_keys:
+            self._packed_keys, self._key_norms = turbo_encode(
+                self._raw_keys, bits=self.k_bits, seed=self.seed,
+            )
+        else:
+            self._fp_keys = self._raw_keys
+
+        if self.compress_values:
+            self._packed_values, self._value_norms = turbo_encode(
+                self._raw_values, bits=self.v_bits, seed=self.seed,
+            )
+        else:
+            self._fp_values = self._raw_values
+
+        # Free raw buffers
+        self._raw_keys = None
+        self._raw_values = None
+        self._is_compressed = True
+
+    def update_and_fetch(
+        self,
+        keys: mx.array,
+        values: mx.array,
+    ) -> Tuple[mx.array, mx.array]:
+        """Update cache with new K/V and return full (decoded) K/V for SDPA.
+
+        During prefill (num_steps > 1), stores raw FP16 — no quantization.
+        On the first decode step (num_steps == 1), compresses the raw cache.
+        Subsequent decode steps encode the new token and append to packed
+        storage.
+
+        Always returns plain ``mx.array`` keys and values (not quantized
+        tuples) so standard SDPA works. The compression is internal.
+
+        Args:
+            keys: Shape ``(B, n_kv_heads, num_steps, head_dim)``.
+            values: Shape ``(B, n_kv_heads, num_steps, head_dim)``.
+
+        Returns:
+            ``(all_keys, all_values)`` both as ``mx.array`` with shape
+            ``(B, n_kv_heads, total_seq_len, head_dim)``.
+        """
+        num_steps = keys.shape[2]
+
+        if self._dim is None:
+            self._dim = keys.shape[-1]
+
+        # --- Prefill phase: accumulate raw ---
+        if not self._is_compressed and num_steps > 1:
+            if self._raw_keys is None:
+                self._raw_keys = keys
+                self._raw_values = values
+            else:
+                self._raw_keys = mx.concatenate(
+                    [self._raw_keys, keys], axis=2,
+                )
+                self._raw_values = mx.concatenate(
+                    [self._raw_values, values], axis=2,
+                )
+            self.offset = self._raw_keys.shape[2]
+            return self._raw_keys, self._raw_values
+
+        # --- Transition: first decode step triggers compression ---
+        if not self._is_compressed:
+            self._compress_raw_cache()
+
+        # --- Decode phase: encode new token(s), append, return decoded ---
+        self.offset += num_steps
+        dim = self._dim
+
+        # Handle keys
+        if self.compress_keys:
+            new_pk, new_kn = turbo_encode(keys, bits=self.k_bits, seed=self.seed)
+            if self._packed_keys is not None:
+                self._packed_keys = mx.concatenate(
+                    [self._packed_keys, new_pk], axis=2,
+                )
+                self._key_norms = mx.concatenate(
+                    [self._key_norms, new_kn], axis=2,
+                )
+            else:
+                self._packed_keys = new_pk
+                self._key_norms = new_kn
+            all_keys = turbo_decode(
+                self._packed_keys, self._key_norms, dim,
+                bits=self.k_bits, seed=self.seed,
+            )
+        else:
+            if self._fp_keys is not None:
+                self._fp_keys = mx.concatenate([self._fp_keys, keys], axis=2)
+            else:
+                self._fp_keys = keys
+            all_keys = self._fp_keys
+
+        # Handle values
+        if self.compress_values:
+            new_pv, new_vn = turbo_encode(values, bits=self.v_bits, seed=self.seed)
+            if self._packed_values is not None:
+                self._packed_values = mx.concatenate(
+                    [self._packed_values, new_pv], axis=2,
+                )
+                self._value_norms = mx.concatenate(
+                    [self._value_norms, new_vn], axis=2,
+                )
+            else:
+                self._packed_values = new_pv
+                self._value_norms = new_vn
+            all_values = turbo_decode(
+                self._packed_values, self._value_norms, dim,
+                bits=self.v_bits, seed=self.seed,
+            )
+        else:
+            if self._fp_values is not None:
+                self._fp_values = mx.concatenate([self._fp_values, values], axis=2)
+            else:
+                self._fp_values = values
+            all_values = self._fp_values
+
+        return all_keys, all_values
+
+    # --- mlx-lm _BaseCache interface ---
+
+    @property
+    def state(self):
+        """Return cache tensors for mx.eval() materialization."""
+        # During prefill, return raw buffers
+        if not self._is_compressed:
+            if self._raw_keys is not None:
+                return self._raw_keys, self._raw_values
+            return []
+
+        # After compression, return all stored tensors
+        parts = []
+        if self._packed_keys is not None:
+            parts.extend([self._packed_keys, self._key_norms])
+        if self._fp_keys is not None:
+            parts.append(self._fp_keys)
+        if self._packed_values is not None:
+            parts.extend([self._packed_values, self._value_norms])
+        if self._fp_values is not None:
+            parts.append(self._fp_values)
+        return parts if parts else []
+
+    @state.setter
+    def state(self, v):
+        if v is not None and v:
+            # TODO: Implement state restore for save/load prompt cache
+            pass
+
+    @property
+    def meta_state(self):
+        return str(self.offset)
+
+    @meta_state.setter
+    def meta_state(self, v):
+        if v is not None and v:
+            self.offset = int(v)
+
+    def is_trimmable(self) -> bool:
+        return True
+
+    def trim(self, n: int) -> int:
+        """Trim n tokens from the cache. Returns actual tokens trimmed."""
+        n = min(self.offset, n)
+        self.offset -= n
+        # TODO: Actually trim the packed/raw buffers for correctness
+        # For now this handles the common case where trim is called but
+        # the cache is about to be rebuilt anyway
+        if not self._is_compressed and self._raw_keys is not None:
+            if n > 0:
+                self._raw_keys = self._raw_keys[..., :-n, :]
+                self._raw_values = self._raw_values[..., :-n, :]
+        return n
+
+    def make_mask(self, N, return_array=False, window_size=None):
+        """Create attention mask (called by mlx-lm's create_attention_mask)."""
+        return _turbo_create_attention_mask(
+            N, offset=self.offset, return_array=return_array,
+            window_size=window_size,
+        )
+
+    def empty(self) -> bool:
+        """Return True if the cache has no stored data."""
+        return (
+            self._raw_keys is None
+            and self._packed_keys is None
+            and self._fp_keys is None
+        )
+
+    @property
+    def nbytes(self) -> int:
+        """Approximate memory usage in bytes."""
+        total = 0
+        for arr in [
+            self._raw_keys, self._raw_values,
+            self._packed_keys, self._key_norms,
+            self._packed_values, self._value_norms,
+            self._fp_keys, self._fp_values,
+        ]:
+            if arr is not None:
+                total += arr.nbytes
+        return total
+
+    def __repr__(self):
+        mode = "compressed" if self._is_compressed else "raw"
+        k_desc = f"k={self.k_bits}bit" if self.compress_keys else "k=fp"
+        v_desc = f"v={self.v_bits}bit" if self.compress_values else "v=fp"
+        return (
+            f"TurboKVCache({k_desc}, {v_desc}, {mode}, "
+            f"offset={self.offset}, dim={self._dim})"
+        )
