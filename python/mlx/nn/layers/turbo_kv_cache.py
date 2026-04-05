@@ -749,12 +749,221 @@ _TURBO_ATTN_SOURCE_4BIT = """
     }
 """
 
+# --- NR0=2 Multi-Row Amortization kernel ---
+# Processes 2 queries per dispatch, sharing K/V dequant (centroid lookup + norm
+# multiply) across both queries. Halves the memory bandwidth cost of reading
+# packed K/V data. Expected speedup: ~30-40% for decode with 2+ pending queries.
+#
+# Layout: grid dispatches one threadgroup per (batch, head) pair, same as NR0=1.
+# Each thread computes scores and V accumulation for BOTH queries simultaneously.
+
+_TURBO_ATTN_SOURCE_4BIT_NR0_2 = """
+    // Grid: (B * n_heads, 1, 1)  — one threadgroup per (batch, head) pair
+    // Threadgroup: (TG_SIZE, 1, 1)
+    //
+    // Inputs:
+    //   q_rot:        [n_bh, NR0, dim]          — NR0=2 pre-rotated queries (WHT domain)
+    //   packed_k:     [n_bh, T_kv, packed_dim]   — packed 4-bit K indices
+    //   k_norms:      [n_bh, T_kv]               — K L2 norms
+    //   packed_v:     [n_bh, T_kv, packed_dim]   — packed 4-bit V indices
+    //   v_norms:      [n_bh, T_kv]               — V L2 norms
+    //   centroids:    [n_levels]                   — centroid lookup table
+    //   params:       [4]                          — {dim, T_kv, packed_dim, scale_bits}
+    //
+    // Outputs:
+    //   out_accum:    [n_bh, NR0, dim]           — WHT-domain weighted sums
+    //   scores:       [n_bh, NR0, T_kv]          — scratch for attention scores
+    //   simd_maxes:   [n_bh, NR0, n_simd_groups] — scratch for simd reductions
+
+    uint tid = thread_position_in_threadgroup.x;
+    uint tg_size = threads_per_threadgroup.x;
+    uint bh_idx = threadgroup_position_in_grid.x;
+
+    int dim = params[0];
+    int T_kv = params[1];
+    int packed_dim = params[2];
+    float scale = as_type<float>(params[3]);
+
+    // Base offsets — NR0=2 queries packed contiguously per (batch, head)
+    int q_base = bh_idx * 2 * dim;      // q_rot[bh_idx, 0..1, :]
+    int kv_base = bh_idx * T_kv;
+    int pk_base = bh_idx * T_kv * packed_dim;
+    int pv_base = bh_idx * T_kv * packed_dim;
+
+    // Score buffers: [n_bh, 2, T_kv]
+    int scores_base_0 = bh_idx * 2 * T_kv;
+    int scores_base_1 = scores_base_0 + T_kv;
+
+    uint simd_lane = thread_index_in_simdgroup;
+    uint simd_id = tid / threads_per_simdgroup;
+    uint n_simd = (tg_size + threads_per_simdgroup - 1) / threads_per_simdgroup;
+    // simd_maxes: [n_bh, 2, n_simd]
+    int smaxes_base_0 = bh_idx * 2 * n_simd;
+    int smaxes_base_1 = smaxes_base_0 + n_simd;
+
+    // --- Phase 1: Compute Q·K scores for BOTH queries, sharing K dequant ---
+    float max_score_0 = -INFINITY;
+    float max_score_1 = -INFINITY;
+
+    for (int t = tid; t < T_kv; t += tg_size) {
+        float dot_0 = 0.0f;
+        float dot_1 = 0.0f;
+        int pk_offset = pk_base + t * packed_dim;
+
+        for (int w = 0; w < packed_dim; w++) {
+            uint word = packed_k[pk_offset + w];  // Shared K dequant — read once
+            int base_d = w * 8;
+
+            for (int j = 0; j < 8 && (base_d + j) < dim; j++) {
+                uint idx = (word >> (j * 4)) & 0xF;
+                float c = centroids[idx];  // Shared centroid lookup
+                int d = base_d + j;
+                dot_0 += q_rot[q_base + d] * c;           // Query 0
+                dot_1 += q_rot[q_base + dim + d] * c;     // Query 1
+            }
+        }
+
+        float norm_k = k_norms[kv_base + t];  // Shared norm
+        float s0 = dot_0 * norm_k * scale;
+        float s1 = dot_1 * norm_k * scale;
+        scores[scores_base_0 + t] = s0;
+        scores[scores_base_1 + t] = s1;
+        max_score_0 = max(max_score_0, s0);
+        max_score_1 = max(max_score_1, s1);
+    }
+
+    // --- Phase 2: Softmax for both queries (parallel reduction) ---
+    // 2a: Reduce max across threadgroup for query 0
+    max_score_0 = simd_max(max_score_0);
+    max_score_1 = simd_max(max_score_1);
+
+    if (simd_lane == 0) {
+        simd_maxes[smaxes_base_0 + simd_id] = max_score_0;
+        simd_maxes[smaxes_base_1 + simd_id] = max_score_1;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    if (tid == 0) {
+        float gmax_0 = simd_maxes[smaxes_base_0];
+        float gmax_1 = simd_maxes[smaxes_base_1];
+        for (uint s = 1; s < n_simd; s++) {
+            gmax_0 = max(gmax_0, simd_maxes[smaxes_base_0 + s]);
+            gmax_1 = max(gmax_1, simd_maxes[smaxes_base_1 + s]);
+        }
+        simd_maxes[smaxes_base_0] = gmax_0;
+        simd_maxes[smaxes_base_1] = gmax_1;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    float global_max_0 = simd_maxes[smaxes_base_0];
+    float global_max_1 = simd_maxes[smaxes_base_1];
+
+    // 2b: exp(score - max) and sum
+    float local_sum_0 = 0.0f;
+    float local_sum_1 = 0.0f;
+    for (int t = tid; t < T_kv; t += tg_size) {
+        float e0 = exp(scores[scores_base_0 + t] - global_max_0);
+        float e1 = exp(scores[scores_base_1 + t] - global_max_1);
+        scores[scores_base_0 + t] = e0;
+        scores[scores_base_1 + t] = e1;
+        local_sum_0 += e0;
+        local_sum_1 += e1;
+    }
+
+    local_sum_0 = simd_sum(local_sum_0);
+    local_sum_1 = simd_sum(local_sum_1);
+    if (simd_lane == 0) {
+        simd_maxes[smaxes_base_0 + simd_id] = local_sum_0;
+        simd_maxes[smaxes_base_1 + simd_id] = local_sum_1;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    if (tid == 0) {
+        float gsum_0 = 0.0f, gsum_1 = 0.0f;
+        for (uint s = 0; s < n_simd; s++) {
+            gsum_0 += simd_maxes[smaxes_base_0 + s];
+            gsum_1 += simd_maxes[smaxes_base_1 + s];
+        }
+        simd_maxes[smaxes_base_0] = gsum_0;
+        simd_maxes[smaxes_base_1] = gsum_1;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    float inv_sum_0 = 1.0f / simd_maxes[smaxes_base_0];
+    float inv_sum_1 = 1.0f / simd_maxes[smaxes_base_1];
+
+    // Normalize scores
+    for (int t = tid; t < T_kv; t += tg_size) {
+        scores[scores_base_0 + t] *= inv_sum_0;
+        scores[scores_base_1 + t] *= inv_sum_1;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // --- Phase 3: V weighted sum for BOTH queries, sharing V dequant ---
+    float v_accum_0[256];
+    float v_accum_1[256];
+    for (int d = 0; d < dim; d++) {
+        v_accum_0[d] = 0.0f;
+        v_accum_1[d] = 0.0f;
+    }
+
+    for (int t = tid; t < T_kv; t += tg_size) {
+        float attn_w_0 = scores[scores_base_0 + t];
+        float attn_w_1 = scores[scores_base_1 + t];
+
+        // Skip if BOTH queries have near-zero attention (fused sparse V)
+        if (attn_w_0 < 1e-6f && attn_w_1 < 1e-6f) continue;
+
+        float norm_v = v_norms[kv_base + t];  // Shared V norm
+        float w_0 = attn_w_0 * norm_v;
+        float w_1 = attn_w_1 * norm_v;
+
+        int pv_offset = pv_base + t * packed_dim;
+        for (int pw = 0; pw < packed_dim; pw++) {
+            uint word = packed_v[pv_offset + pw];  // Shared V dequant
+            int base_d = pw * 8;
+
+            for (int j = 0; j < 8 && (base_d + j) < dim; j++) {
+                uint idx = (word >> (j * 4)) & 0xF;
+                float c = centroids[idx];  // Shared centroid lookup
+                int d = base_d + j;
+                v_accum_0[d] += w_0 * c;
+                v_accum_1[d] += w_1 * c;
+            }
+        }
+    }
+
+    // --- Phase 4: Reduce V accumulators for BOTH queries ---
+    int out_base_0 = bh_idx * 2 * dim;
+    int out_base_1 = out_base_0 + dim;
+
+    for (int d = 0; d < dim; d++) {
+        float val_0 = simd_sum(v_accum_0[d]);
+        float val_1 = simd_sum(v_accum_1[d]);
+
+        if (simd_lane == 0) {
+            simd_maxes[smaxes_base_0 + simd_id] = val_0;
+            simd_maxes[smaxes_base_1 + simd_id] = val_1;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+
+        if (tid == 0) {
+            float total_0 = 0.0f, total_1 = 0.0f;
+            for (uint s = 0; s < n_simd; s++) {
+                total_0 += simd_maxes[smaxes_base_0 + s];
+                total_1 += simd_maxes[smaxes_base_1 + s];
+            }
+            out_accum[out_base_0 + d] = total_0;
+            out_accum[out_base_1 + d] = total_1;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+"""
+
 # Cache the compiled kernel objects to avoid re-JIT on every call
 _kernel_cache: Dict[str, object] = {}
 
 
-def _get_turbo_attn_kernel(bits: int):
-    """Get or create the compressed-domain attention Metal kernel for given bit-width.
+def _get_turbo_attn_kernel(bits: int, nr0: int = 1):
+    """Get or create the compressed-domain attention Metal kernel.
 
     The kernel is JIT-compiled once and cached. Currently supports 4-bit
     (the primary use case). 3-bit and 2-bit use the same kernel structure
@@ -762,26 +971,31 @@ def _get_turbo_attn_kernel(bits: int):
 
     Args:
         bits: Quantization bit-width (2, 3, or 4).
+        nr0: Number of queries to process per dispatch (1 or 2).
+            NR0=2 shares K/V dequant across both queries, halving
+            memory bandwidth for packed data reads.
 
     Returns:
         Compiled Metal kernel callable.
     """
-    cache_key = f"turbo_attn_{bits}bit"
+    cache_key = f"turbo_attn_{bits}bit_nr{nr0}"
     if cache_key in _kernel_cache:
         return _kernel_cache[cache_key]
 
     if bits == 4:
-        source = _TURBO_ATTN_SOURCE_4BIT
+        if nr0 == 2:
+            source = _TURBO_ATTN_SOURCE_4BIT_NR0_2
+        else:
+            source = _TURBO_ATTN_SOURCE_4BIT
     else:
         # TODO: Add 3-bit and 2-bit kernel variants
-        # For now, fall back to decode-then-matmul for non-4-bit
         raise NotImplementedError(
             f"Fused compressed-domain attention not yet implemented for {bits}-bit. "
             "Use turbo_attention() (decode-then-matmul) instead."
         )
 
     kernel = mx.fast.metal_kernel(
-        name=f"turbo_sdpa_{bits}bit",
+        name=f"turbo_sdpa_{bits}bit_nr{nr0}",
         input_names=[
             "q_rot",        # Pre-rotated query (WHT domain)
             "packed_k",     # Packed K indices
@@ -793,7 +1007,7 @@ def _get_turbo_attn_kernel(bits: int):
         ],
         output_names=[
             "out_accum",    # WHT-domain output (before inverse transform)
-            "scores",       # Threadgroup-local score buffer (T_kv floats)
+            "scores",       # Threadgroup-local score buffer
             "simd_maxes",   # Scratch for simd reductions
         ],
         header=_TURBO_ATTN_HEADER,
@@ -817,6 +1031,7 @@ def turbo_fused_attention(
     seed: int = 42,
     scale: Optional[float] = None,
     mask: Optional[mx.array] = None,
+    nr0: Optional[int] = None,
 ) -> mx.array:
     """Compressed-domain attention — no FP16 K/V materialization.
 
@@ -834,15 +1049,16 @@ def turbo_fused_attention(
     - Compute: centroid lookup (16-entry table, register-resident) + FMA
     - No intermediate FP16 K/V buffer allocated
     - Sparse V: skips dequant + accumulate for near-zero attention weights
+    - NR0=2: shares K/V dequant across 2 queries, halving bandwidth cost
 
     **Limitations:**
     - Currently 4-bit only (3-bit and 2-bit planned)
-    - T_q must be 1 (decode only — prefill uses standard SDPA)
+    - T_q must be 1 or 2 (decode only — prefill uses standard SDPA)
     - T_kv limited by threadgroup memory (~16K tokens with 64KB tg mem)
     - mask not yet supported in the fused kernel (use decode-then-matmul path)
 
     Args:
-        queries: Query tensor, shape (batch, heads, 1, dim). T_q must be 1.
+        queries: Query tensor, shape (batch, heads, T_q, dim). T_q must be 1 or 2.
         packed_keys: Packed K indices, shape (batch, heads, T_kv, packed_dim).
         key_norms: K norms, shape (batch, heads, T_kv, 1).
         packed_values: Packed V indices, shape (batch, heads, T_kv, packed_dim).
@@ -852,12 +1068,14 @@ def turbo_fused_attention(
         seed: SRHT random seed. Default: 42.
         scale: Attention scale factor. Default: 1/sqrt(dim).
         mask: NOT YET SUPPORTED in fused kernel. Must be None.
+        nr0: Number of queries per dispatch (1 or 2). None = auto-select
+            based on T_q. NR0=2 shares K/V dequant across both queries.
 
     Returns:
-        Attention output, shape (batch, heads, 1, dim).
+        Attention output, shape (batch, heads, T_q, dim).
 
     Raises:
-        ValueError: If T_q != 1, mask is provided, or dim > 256.
+        ValueError: If T_q > 2, mask is provided, or dim > 256.
         NotImplementedError: If bits != 4.
 
     Example:
@@ -866,11 +1084,15 @@ def turbo_fused_attention(
         >>> pk, kn = turbo_encode(k, bits=4)
         >>> pv, vn = turbo_encode(k, bits=4)  # using k for demo
         >>> out = turbo_fused_attention(q, pk, kn, pv, vn, dim=128)
+        >>> # NR0=2: process 2 queries sharing dequant work
+        >>> q2 = mx.random.normal((1, 8, 2, 128))
+        >>> out2 = turbo_fused_attention(q2, pk, kn, pv, vn, dim=128, nr0=2)
     """
-    if queries.shape[2] != 1:
+    T_q = queries.shape[2]
+    if T_q > 2:
         raise ValueError(
-            f"turbo_fused_attention only supports T_q=1 (decode), got T_q={queries.shape[2]}. "
-            "Use turbo_attention() for prefill (T_q > 1)."
+            f"turbo_fused_attention supports T_q=1 or T_q=2, got T_q={T_q}. "
+            "Use turbo_attention() for prefill (T_q > 2)."
         )
     if mask is not None:
         raise ValueError(
@@ -886,7 +1108,32 @@ def turbo_fused_attention(
     if scale is None:
         scale = 1.0 / math.sqrt(dim)
 
-    kernel = _get_turbo_attn_kernel(bits)
+    # Auto-select NR0 based on T_q if not explicitly specified
+    if nr0 is None:
+        nr0 = T_q  # 1 query → NR0=1, 2 queries → NR0=2
+
+    # Validate NR0/T_q compatibility
+    if nr0 == 2 and T_q < 2:
+        raise ValueError(
+            f"NR0=2 requires T_q >= 2, got T_q={T_q}. "
+            "Use NR0=1 for single-query decode."
+        )
+
+    # NR0=2 dispatch
+    if nr0 == 2:
+        return _turbo_fused_attention_nr0_2(
+            queries, packed_keys, key_norms, packed_values,
+            value_norms, dim, bits, seed, scale,
+        )
+
+    # NR0=1 (original) dispatch
+    if T_q != 1:
+        raise ValueError(
+            f"NR0=1 requires T_q=1, got T_q={T_q}. "
+            "Use NR0=2 for T_q=2 or turbo_attention() for larger T_q."
+        )
+
+    kernel = _get_turbo_attn_kernel(bits, nr0=1)
     cb = _get_codebook(bits, dim)
 
     B, n_heads, T_kv, packed_dim = packed_keys.shape
@@ -957,6 +1204,102 @@ def turbo_fused_attention(
     # output = signs * WHT(out_rot)
     # (WHT is its own inverse for orthonormal normalization)
     out_rot = out_rot.reshape(B, n_heads, 1, dim)
+    out_transformed = mx.hadamard_transform(out_rot)
+    output = out_transformed * signs
+
+    return output.astype(queries.dtype)
+
+
+def _turbo_fused_attention_nr0_2(
+    queries: mx.array,
+    packed_keys: mx.array,
+    key_norms: mx.array,
+    packed_values: mx.array,
+    value_norms: mx.array,
+    dim: int,
+    bits: int,
+    seed: int,
+    scale: float,
+) -> mx.array:
+    """NR0=2 multi-row amortization: process 2 queries sharing K/V dequant.
+
+    Internal helper called by turbo_fused_attention when NR0=2 is selected.
+    The Metal kernel reads each packed K/V word once and computes dot products
+    with both queries simultaneously, halving the memory bandwidth cost.
+
+    Args:
+        queries: Shape (B, n_heads, 2, dim) — exactly 2 queries.
+        packed_keys: Shape (B, n_heads, T_kv, packed_dim).
+        key_norms: Shape (B, n_heads, T_kv, 1).
+        packed_values: Shape (B, n_heads, T_kv, packed_dim).
+        value_norms: Shape (B, n_heads, T_kv, 1).
+        dim: Head dimension.
+        bits: Quantization bit-width.
+        seed: SRHT seed.
+        scale: Attention scale factor.
+
+    Returns:
+        Attention output, shape (B, n_heads, 2, dim).
+    """
+    kernel = _get_turbo_attn_kernel(bits, nr0=2)
+    cb = _get_codebook(bits, dim)
+
+    B, n_heads, T_kv, packed_dim = packed_keys.shape
+
+    # Pre-rotate both queries into WHT domain
+    signs = _sign_flip_vector(dim, seed)
+    q_flipped = queries * signs                 # (B, n_heads, 2, dim)
+    q_rot = mx.hadamard_transform(q_flipped)    # (B, n_heads, 2, dim)
+    q_rot = q_rot.astype(mx.float32)
+
+    # Flatten norms
+    k_norms_flat = key_norms.squeeze(-1).astype(mx.float32)
+    v_norms_flat = value_norms.squeeze(-1).astype(mx.float32)
+
+    # Encode scale
+    import struct
+    scale_as_uint32 = struct.unpack('I', struct.pack('f', scale))[0]
+    params = mx.array([dim, T_kv, packed_dim, scale_as_uint32], dtype=mx.uint32)
+
+    n_bh = B * n_heads
+    tg_size = min(64, max(32, T_kv))
+    tg_size = ((tg_size + 31) // 32) * 32
+
+    # Reshape: NR0=2 queries are packed as (n_bh, 2, dim)
+    q_rot_flat = q_rot.reshape(n_bh, 2, dim)
+    pk_flat = packed_keys.reshape(n_bh, T_kv, packed_dim)
+    kn_flat = k_norms_flat.reshape(n_bh, T_kv)
+    pv_flat = packed_values.reshape(n_bh, T_kv, packed_dim)
+    vn_flat = v_norms_flat.reshape(n_bh, T_kv)
+
+    n_simd_groups = tg_size // 32
+
+    outputs = kernel(
+        inputs=[
+            q_rot_flat,
+            pk_flat,
+            kn_flat,
+            pv_flat,
+            vn_flat,
+            cb.centroids,
+            params,
+        ],
+        output_shapes=[
+            (n_bh, 2, dim),           # out_accum for both queries
+            (n_bh, 2, T_kv),          # scores scratch for both queries
+            (n_bh, 2, n_simd_groups), # simd_maxes scratch for both queries
+        ],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+        grid=(n_bh * tg_size, 1, 1),
+        threadgroup=(tg_size, 1, 1),
+        init_value=0.0,
+        stream=mx.gpu,
+    )
+
+    out_rot = outputs[0]  # (n_bh, 2, dim)
+
+    # Inverse transform back to original domain
+    out_rot = out_rot.reshape(B, n_heads, 2, dim)
     out_transformed = mx.hadamard_transform(out_rot)
     output = out_transformed * signs
 
