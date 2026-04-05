@@ -499,6 +499,20 @@ def turbo_attention(
     # See: sparse-v-dequant.md — many post-softmax weights are near-zero,
     # making those V dequant+matmul ops wasted compute. By zeroing them
     # out before the matmul, MLX can potentially skip those lanes entirely.
+    #
+    # TODO: Sparse V integration with TurboKVCache (Item 9)
+    # This sparse mask works in turbo_attention() (decode-then-matmul path),
+    # but TurboKVCache uses standard SDPA via mlx-lm's base.py — it returns
+    # plain mx.array K/V tensors and the model calls mx.fast.scaled_dot_product_attention.
+    # To integrate sparse V at the model level:
+    #   1. Add a post-SDPA hook in TurboKVCache, or
+    #   2. Modify mlx-lm's base.py to accept a sparse_mask callback, or
+    #   3. Implement a fused Metal kernel that does SDPA + sparse skip in one pass
+    # Option 3 is the real win — skip V dequant entirely for near-zero attention
+    # positions, saving both compute and memory bandwidth. Options 1-2 still
+    # materialize all V tokens to FP16 before the matmul.
+    # For now, sparse_attention_mask() is available as a standalone utility that
+    # users can apply manually if they write custom attention loops.
     sparse_mask = sparse_attention_mask(weights)
     weights = weights * sparse_mask
 
