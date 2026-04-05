@@ -195,6 +195,10 @@ def turbo_encode(
     cb = _get_codebook(bits, dim)
 
     # 1. Extract norms and normalize to unit sphere
+    # NOTE: No norm correction needed — WHT (hadamard_transform) is orthogonal,
+    # so norms are exactly preserved through the transform. Storing raw norms
+    # is sufficient. This saves a codebook lookup + norm computation + division
+    # per encoded vector vs. the corrected-norm approach.
     norms = mx.linalg.norm(x, axis=-1, keepdims=True)
     # Avoid division by zero
     safe_norms = mx.maximum(norms, mx.array(1e-10))
