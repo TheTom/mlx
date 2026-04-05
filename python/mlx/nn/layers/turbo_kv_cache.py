@@ -210,6 +210,17 @@ def turbo_encode(
 
     # 3. Apply Walsh-Hadamard Transform
     # mx.hadamard_transform default scale is 1/sqrt(N), giving us orthonormal WHT
+    #
+    # TODO: Block-size optimization (block-size-experiment.md)
+    # Our paper found that WHT block_size=32 (matching Apple Silicon SIMD width)
+    # gives the best decode speed in llama.cpp — matching q8_0 throughput. The
+    # current implementation uses full head_dim (128) as the transform size.
+    # Splitting into blocks of 32 would require reshaping:
+    #   x_flipped.reshape(..., dim // 32, 32) → hadamard_transform → reshape back
+    # Trade-off: block_size=32 is faster but slightly worse quality because the
+    # WHT only decorrelates within each 32-element block, not across the full
+    # head_dim. For MLX, this would need profiling — Metal's SIMD may not have
+    # the same 32-wide sweet spot as ARM NEON in llama.cpp.
     x_rotated = mx.hadamard_transform(x_flipped)
 
     # 4. Boundary quantize → indices
@@ -268,6 +279,8 @@ def turbo_decode(
 
     # 3. Inverse WHT (Hadamard is its own inverse up to scaling)
     # Since we used orthonormal (scale=1/sqrt(N)), applying it again gives identity
+    # NOTE: If block_size optimization is added to encode (see TODO there),
+    # the same reshape→transform→reshape must be applied here in reverse.
     x_flipped = mx.hadamard_transform(x_rotated)
 
     # 4. Inverse sign flip (signs are their own inverse: s * s = 1)
