@@ -1462,6 +1462,7 @@ class TurboKVCache:
         key_bits: Optional[int] = None,
         seed: int = 42,
         min_compress_tokens: int = 256,
+        fused_attention: bool = False,
     ):
         self.v_bits = bits
         self.k_bits = key_bits if key_bits is not None else bits
@@ -1470,6 +1471,11 @@ class TurboKVCache:
         # The memory savings at short context are <2MB but the speed cost of
         # encode/decode is ~30%. Only compress when the cache exceeds this size.
         self.min_compress_tokens = min_compress_tokens
+
+        # When True, skip creating decoded FP16 buffers during compression.
+        # Use cache.attention() instead of update_and_fetch + SDPA to avoid
+        # the double-storage problem. Requires symmetric 4-bit, Metal GPU.
+        self._fused_attention = fused_attention
 
         # Raw (uncompressed) storage — used during prefill
         self._raw_keys: Optional[mx.array] = None
@@ -1491,6 +1497,7 @@ class TurboKVCache:
         # every step. Only the newly added token(s) get decoded and concatenated.
         # This matches the llama.cpp approach: compressed storage is source of
         # truth for memory savings, decoded FP16 window is for fast attention.
+        # Skipped when fused_attention=True (fused kernel reads packed directly).
         self._decoded_keys: Optional[mx.array] = None
         self._decoded_values: Optional[mx.array] = None
 
@@ -1524,11 +1531,14 @@ class TurboKVCache:
                 self._raw_keys, bits=self.k_bits, seed=self.seed,
             )
             # Decode once to seed the FP16 cache — subsequent steps only
-            # decode the new token and concatenate (O(1) not O(n))
-            self._decoded_keys = turbo_decode(
-                self._packed_keys, self._key_norms, self._dim,
-                bits=self.k_bits, seed=self.seed,
-            )
+            # decode the new token and concatenate (O(1) not O(n)).
+            # Skip when fused_attention=True: the fused kernel reads packed
+            # data directly, so decoded FP16 buffers waste memory.
+            if not self._fused_attention:
+                self._decoded_keys = turbo_decode(
+                    self._packed_keys, self._key_norms, self._dim,
+                    bits=self.k_bits, seed=self.seed,
+                )
         else:
             self._fp_keys = self._raw_keys
 
@@ -1536,11 +1546,13 @@ class TurboKVCache:
             self._packed_values, self._value_norms = turbo_encode(
                 self._raw_values, bits=self.v_bits, seed=self.seed,
             )
-            # Same: decode once, then incremental
-            self._decoded_values = turbo_decode(
-                self._packed_values, self._value_norms, self._dim,
-                bits=self.v_bits, seed=self.seed,
-            )
+            # Same: decode once, then incremental.
+            # Skip when fused_attention=True.
+            if not self._fused_attention:
+                self._decoded_values = turbo_decode(
+                    self._packed_values, self._value_norms, self._dim,
+                    bits=self.v_bits, seed=self.seed,
+                )
         else:
             self._fp_values = self._raw_values
 
@@ -1725,16 +1737,23 @@ class TurboKVCache:
         if self._dim is None:
             self._dim = dim
 
-        can_fuse = (
+        # Check if we should trigger compression for the fused path.
+        # This handles the transition from prefill → decode when
+        # fused_attention=True, compressing without creating decoded FP16.
+        _wants_fuse = (
             num_steps == 1
-            and self._is_compressed
             and self.compress_keys
             and self.compress_values
-            and self.k_bits == self.v_bits == 4  # Only 4-bit fused kernel so far
+            and self.k_bits == self.v_bits == 4
             and mask is None
             and dim <= 256
             and mx.metal.is_available()
         )
+        if _wants_fuse and not self._is_compressed and self.offset >= self.min_compress_tokens:
+            # Trigger compression (skips decoded FP16 if fused_attention=True)
+            self._compress_raw_cache()
+
+        can_fuse = _wants_fuse and self._is_compressed
 
         if can_fuse:
             # Encode the new token and append to packed storage
