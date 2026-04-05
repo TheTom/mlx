@@ -108,5 +108,6 @@ from mlx.nn.layers.turbo_kv_cache import (
     turbo_attention,
     turbo_decode,
     turbo_encode,
+    turbo_fused_attention,
 )
 from mlx.nn.layers.upsample import Upsample

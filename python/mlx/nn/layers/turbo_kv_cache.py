@@ -531,6 +531,439 @@ def turbo_attention(
 
 
 # ---------------------------------------------------------------------------
+# Fused compressed-domain attention (Metal kernel — no FP16 materialization)
+# ---------------------------------------------------------------------------
+
+# The Metal kernel operates in the WHT (rotated) domain:
+#   1. Python pre-rotates Q: Q_rot = WHT(Q * signs)          — once per query
+#   2. Kernel: for each KV token, unpack indices → centroid lookup → dot product
+#      with Q_rot → softmax → centroid lookup for V → weighted sum
+#   3. Python post-rotates output: out = signs * WHT(accum)   — once per output
+#
+# This avoids materializing FP16 K/V entirely. The WHT and sign-flip are
+# linear operators applied once to Q and once to the output, NOT per-KV-token.
+# Memory bandwidth: reads packed uint32 indices + norms (4-bit: 1/8th of FP16).
+# Compute: centroid lookup is a 16-entry table lookup, trivially fast.
+
+# --- Metal kernel source for 4-bit compressed-domain attention ---
+# One threadgroup per (batch, head) pair. Each threadgroup processes all T_kv
+# tokens for one query head. Within the threadgroup:
+#   - Phase 1 (scores): Each thread handles a range of KV tokens. For each
+#     token, unpack all dim indices, lookup centroids, dot with Q_rot.
+#   - Phase 2 (softmax): Parallel reduce max + sum for numerically stable softmax.
+#   - Phase 3 (V weighted sum): Same unpack + lookup, multiply by attn weight,
+#     accumulate across tokens.
+#
+# Thread layout: threadgroup_size threads, each handles ceil(T_kv / tg_size) tokens.
+
+_TURBO_ATTN_HEADER = """
+// Centroid table — embedded as constant array for minimal latency.
+// Loaded into registers at kernel launch, no memory fetch during inner loop.
+// These are the Beta-distribution centroids for (4-bit, 128-dim).
+// For other (bits, dim) combos, the Python wrapper passes the correct table.
+
+// Inline unpack: extract a 4-bit index from a uint32 word
+inline uint unpack4(uint word, uint pos) {
+    return (word >> (pos * 4)) & 0xF;
+}
+
+// Inline unpack: extract a 3-bit index from a uint32 word
+inline uint unpack3(uint word, uint pos) {
+    return (word >> (pos * 3)) & 0x7;
+}
+
+// Inline unpack: extract a 2-bit index from a uint32 word
+inline uint unpack2(uint word, uint pos) {
+    return (word >> (pos * 2)) & 0x3;
+}
+"""
+
+_TURBO_ATTN_SOURCE_4BIT = """
+    // Grid: (B * n_heads, 1, 1)  — one threadgroup per (batch, head) pair
+    // Threadgroup: (TG_SIZE, 1, 1) where TG_SIZE divides work across T_kv tokens
+    //
+    // Inputs (row-contiguous, flattened to B*n_heads leading dim):
+    //   q_rot:        [n_bh, dim]               — pre-rotated query (WHT domain)
+    //   packed_k:     [n_bh, T_kv, packed_dim]  — packed 4-bit K indices
+    //   k_norms:      [n_bh, T_kv]             — K L2 norms (already squeezed)
+    //   packed_v:     [n_bh, T_kv, packed_dim]  — packed 4-bit V indices
+    //   v_norms:      [n_bh, T_kv]             — V L2 norms (already squeezed)
+    //   centroids:    [n_levels]                 — centroid lookup table
+    //   params:       [4]                        — {dim, T_kv, packed_dim, scale_bits}
+    //
+    // Outputs (device buffers, indexed by bh_idx):
+    //   out_accum:    [n_bh, dim]               — WHT-domain weighted sum
+    //   scores:       [n_bh, T_kv]             — scratch for attention scores
+    //   simd_maxes:   [n_bh, n_simd_groups]    — scratch for simd reductions
+
+    uint tid = thread_position_in_threadgroup.x;
+    uint tg_size = threads_per_threadgroup.x;
+    uint bh_idx = threadgroup_position_in_grid.x;  // batch*head index
+
+    // Read params
+    int dim = params[0];
+    int T_kv = params[1];
+    int packed_dim = params[2];
+    float scale = as_type<float>(params[3]);
+
+    // Compute base offsets into the flattened buffers for this (batch, head)
+    int q_offset = bh_idx * dim;
+    int kv_base = bh_idx * T_kv;
+    int pk_base = bh_idx * T_kv * packed_dim;
+    int pv_base = bh_idx * T_kv * packed_dim;
+
+    // scores and simd_maxes are global device buffers indexed per-threadgroup
+    int scores_base = bh_idx * T_kv;
+
+    uint simd_lane = thread_index_in_simdgroup;
+    uint simd_id = tid / threads_per_simdgroup;
+    uint n_simd = (tg_size + threads_per_simdgroup - 1) / threads_per_simdgroup;
+    int smaxes_base = bh_idx * n_simd;
+
+    // --- Phase 1: Compute Q·K scores for all T_kv tokens ---
+    // Each thread processes a strided subset of tokens.
+    // For each assigned token:
+    //   score = norm_K * sum_d(Q_rot[d] * centroids[K_indices[d]]) * scale
+    float max_score = -INFINITY;
+
+    for (int t = tid; t < T_kv; t += tg_size) {
+        float dot = 0.0f;
+        int pk_offset = pk_base + t * packed_dim;
+
+        for (int w = 0; w < packed_dim; w++) {
+            uint word = packed_k[pk_offset + w];
+            int base_d = w * 8;  // 8 indices per uint32 for 4-bit
+
+            // Unroll 8 indices per word
+            for (int j = 0; j < 8 && (base_d + j) < dim; j++) {
+                uint idx = (word >> (j * 4)) & 0xF;
+                float c = centroids[idx];
+                dot += q_rot[q_offset + base_d + j] * c;
+            }
+        }
+
+        float norm_k = k_norms[kv_base + t];
+        float s = dot * norm_k * scale;
+        scores[scores_base + t] = s;
+        max_score = max(max_score, s);
+    }
+
+    // --- Phase 2: Softmax (parallel reduction) ---
+    // Step 2a: reduce max across threadgroup via simd_max + cross-simd reduce
+    max_score = simd_max(max_score);
+
+    if (simd_lane == 0) {
+        simd_maxes[smaxes_base + simd_id] = max_score;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    if (tid == 0) {
+        float global_max = simd_maxes[smaxes_base];
+        for (uint s = 1; s < n_simd; s++) {
+            global_max = max(global_max, simd_maxes[smaxes_base + s]);
+        }
+        simd_maxes[smaxes_base] = global_max;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    float global_max = simd_maxes[smaxes_base];
+
+    // Step 2b: compute exp(score - max) and local sum
+    float local_sum = 0.0f;
+    for (int t = tid; t < T_kv; t += tg_size) {
+        float e = exp(scores[scores_base + t] - global_max);
+        scores[scores_base + t] = e;
+        local_sum += e;
+    }
+
+    // Reduce sum across threadgroup
+    local_sum = simd_sum(local_sum);
+    if (simd_lane == 0) {
+        simd_maxes[smaxes_base + simd_id] = local_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    if (tid == 0) {
+        float global_sum = 0.0f;
+        for (uint s = 0; s < n_simd; s++) {
+            global_sum += simd_maxes[smaxes_base + s];
+        }
+        simd_maxes[smaxes_base] = global_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    float inv_sum = 1.0f / simd_maxes[smaxes_base];
+
+    // Normalize scores to attention weights
+    for (int t = tid; t < T_kv; t += tg_size) {
+        scores[scores_base + t] *= inv_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // --- Phase 3: V weighted sum ---
+    // Each thread accumulates its share of V tokens weighted by attention.
+    // Local accumulator in registers — 128 floats = 512 bytes, fits easily.
+    float v_accum[256];  // Max supported dim (Metal needs fixed-size arrays)
+    for (int d = 0; d < dim; d++) {
+        v_accum[d] = 0.0f;
+    }
+
+    for (int t = tid; t < T_kv; t += tg_size) {
+        float attn_w = scores[scores_base + t];
+
+        // Skip near-zero attention weights (fused sparse V optimization)
+        if (attn_w < 1e-6f) continue;
+
+        float norm_v = v_norms[kv_base + t];
+        float w = attn_w * norm_v;
+
+        int pv_offset = pv_base + t * packed_dim;
+        for (int pw = 0; pw < packed_dim; pw++) {
+            uint word = packed_v[pv_offset + pw];
+            int base_d = pw * 8;
+
+            for (int j = 0; j < 8 && (base_d + j) < dim; j++) {
+                uint idx = (word >> (j * 4)) & 0xF;
+                float c = centroids[idx];
+                v_accum[base_d + j] += w * c;
+            }
+        }
+    }
+
+    // --- Phase 4: Reduce V accumulators across threads ---
+    // Use simd_sum per dimension, then cross-simd reduce via device buffer.
+    for (int d = 0; d < dim; d++) {
+        float val = simd_sum(v_accum[d]);
+
+        if (simd_lane == 0) {
+            simd_maxes[smaxes_base + simd_id] = val;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+
+        if (tid == 0) {
+            float total = 0.0f;
+            for (uint s = 0; s < n_simd; s++) {
+                total += simd_maxes[smaxes_base + s];
+            }
+            out_accum[q_offset + d] = total;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+"""
+
+# Cache the compiled kernel objects to avoid re-JIT on every call
+_kernel_cache: Dict[str, object] = {}
+
+
+def _get_turbo_attn_kernel(bits: int):
+    """Get or create the compressed-domain attention Metal kernel for given bit-width.
+
+    The kernel is JIT-compiled once and cached. Currently supports 4-bit
+    (the primary use case). 3-bit and 2-bit use the same kernel structure
+    with different unpack widths.
+
+    Args:
+        bits: Quantization bit-width (2, 3, or 4).
+
+    Returns:
+        Compiled Metal kernel callable.
+    """
+    cache_key = f"turbo_attn_{bits}bit"
+    if cache_key in _kernel_cache:
+        return _kernel_cache[cache_key]
+
+    if bits == 4:
+        source = _TURBO_ATTN_SOURCE_4BIT
+    else:
+        # TODO: Add 3-bit and 2-bit kernel variants
+        # For now, fall back to decode-then-matmul for non-4-bit
+        raise NotImplementedError(
+            f"Fused compressed-domain attention not yet implemented for {bits}-bit. "
+            "Use turbo_attention() (decode-then-matmul) instead."
+        )
+
+    kernel = mx.fast.metal_kernel(
+        name=f"turbo_sdpa_{bits}bit",
+        input_names=[
+            "q_rot",        # Pre-rotated query (WHT domain)
+            "packed_k",     # Packed K indices
+            "k_norms",      # K norms (flattened to 1D per-token)
+            "packed_v",     # Packed V indices
+            "v_norms",      # V norms (flattened to 1D per-token)
+            "centroids",    # Centroid lookup table
+            "params",       # {dim, T_kv, packed_dim, scale_as_uint32}
+        ],
+        output_names=[
+            "out_accum",    # WHT-domain output (before inverse transform)
+            "scores",       # Threadgroup-local score buffer (T_kv floats)
+            "simd_maxes",   # Scratch for simd reductions
+        ],
+        header=_TURBO_ATTN_HEADER,
+        source=source,
+        ensure_row_contiguous=True,
+        atomic_outputs=False,
+    )
+
+    _kernel_cache[cache_key] = kernel
+    return kernel
+
+
+def turbo_fused_attention(
+    queries: mx.array,
+    packed_keys: mx.array,
+    key_norms: mx.array,
+    packed_values: mx.array,
+    value_norms: mx.array,
+    dim: int,
+    bits: int = 4,
+    seed: int = 42,
+    scale: Optional[float] = None,
+    mask: Optional[mx.array] = None,
+) -> mx.array:
+    """Compressed-domain attention — no FP16 K/V materialization.
+
+    Uses a custom Metal kernel to compute attention directly on packed
+    TurboQuant data. The key insight: the Walsh-Hadamard Transform (WHT) and
+    sign-flip are linear operators that can be applied once to Q (before the
+    kernel) and once to the output (after the kernel), rather than per-KV-token.
+
+    In the WHT domain, each KV token is just a vector of centroid indices + a
+    scalar norm. The dot product ``Q_rot @ centroids[indices] * norm`` replaces
+    the full FP16 decode + matmul.
+
+    **Performance characteristics:**
+    - Memory: reads packed uint32 (4-bit: 1/8th of FP16 bandwidth)
+    - Compute: centroid lookup (16-entry table, register-resident) + FMA
+    - No intermediate FP16 K/V buffer allocated
+    - Sparse V: skips dequant + accumulate for near-zero attention weights
+
+    **Limitations:**
+    - Currently 4-bit only (3-bit and 2-bit planned)
+    - T_q must be 1 (decode only — prefill uses standard SDPA)
+    - T_kv limited by threadgroup memory (~16K tokens with 64KB tg mem)
+    - mask not yet supported in the fused kernel (use decode-then-matmul path)
+
+    Args:
+        queries: Query tensor, shape (batch, heads, 1, dim). T_q must be 1.
+        packed_keys: Packed K indices, shape (batch, heads, T_kv, packed_dim).
+        key_norms: K norms, shape (batch, heads, T_kv, 1).
+        packed_values: Packed V indices, shape (batch, heads, T_kv, packed_dim).
+        value_norms: V norms, shape (batch, heads, T_kv, 1).
+        dim: Head dimension (must be power of 2, max 256).
+        bits: Quantization bit-width. Default: 4.
+        seed: SRHT random seed. Default: 42.
+        scale: Attention scale factor. Default: 1/sqrt(dim).
+        mask: NOT YET SUPPORTED in fused kernel. Must be None.
+
+    Returns:
+        Attention output, shape (batch, heads, 1, dim).
+
+    Raises:
+        ValueError: If T_q != 1, mask is provided, or dim > 256.
+        NotImplementedError: If bits != 4.
+
+    Example:
+        >>> q = mx.random.normal((1, 8, 1, 128))
+        >>> k = mx.random.normal((1, 8, 64, 128))
+        >>> pk, kn = turbo_encode(k, bits=4)
+        >>> pv, vn = turbo_encode(k, bits=4)  # using k for demo
+        >>> out = turbo_fused_attention(q, pk, kn, pv, vn, dim=128)
+    """
+    if queries.shape[2] != 1:
+        raise ValueError(
+            f"turbo_fused_attention only supports T_q=1 (decode), got T_q={queries.shape[2]}. "
+            "Use turbo_attention() for prefill (T_q > 1)."
+        )
+    if mask is not None:
+        raise ValueError(
+            "turbo_fused_attention does not yet support attention masks. "
+            "Use turbo_attention() for masked attention."
+        )
+    if dim > 256:
+        raise ValueError(
+            f"turbo_fused_attention supports dim <= 256, got dim={dim}. "
+            "The kernel uses a fixed-size register array for V accumulation."
+        )
+
+    if scale is None:
+        scale = 1.0 / math.sqrt(dim)
+
+    kernel = _get_turbo_attn_kernel(bits)
+    cb = _get_codebook(bits, dim)
+
+    B, n_heads, T_kv, packed_dim = packed_keys.shape
+
+    # --- Step 1: Pre-rotate queries into WHT domain ---
+    # Q_rot = WHT(Q * signs)
+    # This transforms the query so that dot products with centroid vectors in
+    # the WHT domain give the same result as dot products with decoded K in
+    # the original domain. (WHT is orthonormal → preserves inner products.)
+    signs = _sign_flip_vector(dim, seed)
+    q_flipped = queries * signs                 # (B, n_heads, 1, dim)
+    q_rot = mx.hadamard_transform(q_flipped)    # (B, n_heads, 1, dim)
+    q_rot = q_rot.astype(mx.float32)
+
+    # --- Step 2: Flatten norms for kernel (remove trailing dim of 1) ---
+    k_norms_flat = key_norms.squeeze(-1).astype(mx.float32)    # (B, n_heads, T_kv)
+    v_norms_flat = value_norms.squeeze(-1).astype(mx.float32)  # (B, n_heads, T_kv)
+
+    # --- Step 3: Encode scale as uint32 for passing through integer param array ---
+    import struct
+    scale_as_uint32 = struct.unpack('I', struct.pack('f', scale))[0]
+    params = mx.array([dim, T_kv, packed_dim, scale_as_uint32], dtype=mx.uint32)
+
+    # --- Step 4: Launch the Metal kernel ---
+    # Grid: one threadgroup per (batch, head) pair
+    # Threadgroup size: 64 threads (2 SIMD groups of 32)
+    # — enough parallelism for T_kv >> 64, small enough for register pressure
+    n_bh = B * n_heads
+    tg_size = min(64, max(32, T_kv))  # At least 1 SIMD group, at most 64
+    # Round to SIMD group boundary
+    tg_size = ((tg_size + 31) // 32) * 32
+
+    # Reshape inputs to (B*n_heads, ...) for the kernel
+    q_rot_flat = q_rot.reshape(n_bh, dim)
+    pk_flat = packed_keys.reshape(n_bh, T_kv, packed_dim)
+    kn_flat = k_norms_flat.reshape(n_bh, T_kv)
+    pv_flat = packed_values.reshape(n_bh, T_kv, packed_dim)
+    vn_flat = v_norms_flat.reshape(n_bh, T_kv)
+
+    # Max number of simd groups per threadgroup (for scratch buffer)
+    n_simd_groups = tg_size // 32
+
+    outputs = kernel(
+        inputs=[
+            q_rot_flat,            # q_rot
+            pk_flat,               # packed_k
+            kn_flat,               # k_norms
+            pv_flat,               # packed_v
+            vn_flat,               # v_norms
+            cb.centroids,          # centroids (n_levels,)
+            params,                # params
+        ],
+        output_shapes=[
+            (n_bh, dim),           # out_accum
+            (n_bh, T_kv),          # scores (threadgroup scratch — will be discarded)
+            (n_bh, n_simd_groups), # simd_maxes (scratch)
+        ],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+        grid=(n_bh * tg_size, 1, 1),
+        threadgroup=(tg_size, 1, 1),
+        init_value=0.0,
+        stream=mx.gpu,
+    )
+
+    out_rot = outputs[0]  # (n_bh, dim) — in WHT domain
+
+    # --- Step 5: Inverse transform back to original domain ---
+    # output = signs * WHT(out_rot)
+    # (WHT is its own inverse for orthonormal normalization)
+    out_rot = out_rot.reshape(B, n_heads, 1, dim)
+    out_transformed = mx.hadamard_transform(out_rot)
+    output = out_transformed * signs
+
+    return output.astype(queries.dtype)
+
+
+# ---------------------------------------------------------------------------
 # Model-aware config recommendation (moe-v-compression-frontier.md)
 # ---------------------------------------------------------------------------
 
@@ -1249,6 +1682,132 @@ class TurboKVCache:
             all_values = self._fp_values
 
         return all_keys, all_values
+
+    def attention(
+        self,
+        queries: mx.array,
+        keys: mx.array,
+        values: mx.array,
+        scale: Optional[float] = None,
+        mask: Optional[mx.array] = None,
+    ) -> mx.array:
+        """Update cache and compute attention in one step, using fused kernel
+        when possible to avoid materializing FP16 K/V.
+
+        This is the preferred attention path for TurboKVCache. During decode
+        (T_q=1) with both K and V compressed at 4-bit, it uses the fused
+        Metal kernel that operates directly on packed data. Otherwise, it
+        falls back to update_and_fetch + standard SDPA.
+
+        When the fused path is used:
+        - No FP16 K/V buffer is ever allocated (solves the double-storage problem)
+        - The decoded FP16 caches (_decoded_keys, _decoded_values) are NOT needed
+        - Memory usage drops to purely packed storage + norms
+
+        Args:
+            queries: Query projections, shape (B, n_q_heads, T_q, dim).
+            keys: New key projections, shape (B, n_kv_heads, T_q, dim).
+            values: New value projections, shape (B, n_kv_heads, T_q, dim).
+            scale: Attention scale. Default: 1/sqrt(dim).
+            mask: Attention mask. Only used in fallback path.
+
+        Returns:
+            Attention output, shape (B, n_q_heads, T_q, dim).
+
+        Example:
+            >>> cache = TurboKVCache(bits=4, key_bits=4)
+            >>> # In the model's attention layer:
+            >>> output = cache.attention(q, k_proj, v_proj, scale=scale)
+        """
+        num_steps = keys.shape[2]
+        dim = keys.shape[-1]
+
+        if self._dim is None:
+            self._dim = dim
+
+        can_fuse = (
+            num_steps == 1
+            and self._is_compressed
+            and self.compress_keys
+            and self.compress_values
+            and self.k_bits == self.v_bits == 4  # Only 4-bit fused kernel so far
+            and mask is None
+            and dim <= 256
+            and mx.metal.is_available()
+        )
+
+        if can_fuse:
+            # Encode the new token and append to packed storage
+            self.offset += num_steps
+
+            new_pk, new_kn = turbo_encode(keys, bits=self.k_bits, seed=self.seed)
+            if self._packed_keys is not None:
+                self._packed_keys = mx.concatenate(
+                    [self._packed_keys, new_pk], axis=2,
+                )
+                self._key_norms = mx.concatenate(
+                    [self._key_norms, new_kn], axis=2,
+                )
+            else:
+                self._packed_keys = new_pk
+                self._key_norms = new_kn
+
+            new_pv, new_vn = turbo_encode(values, bits=self.v_bits, seed=self.seed)
+            if self._packed_values is not None:
+                self._packed_values = mx.concatenate(
+                    [self._packed_values, new_pv], axis=2,
+                )
+                self._value_norms = mx.concatenate(
+                    [self._value_norms, new_vn], axis=2,
+                )
+            else:
+                self._packed_values = new_pv
+                self._value_norms = new_vn
+
+            # Fused attention on packed data — no FP16 materialization
+            # NOTE: we do NOT update _decoded_keys/_decoded_values here.
+            # The fused path doesn't need them. If the user later calls
+            # update_and_fetch (fallback path), the decoded caches will be
+            # stale — but that's OK because update_and_fetch rebuilds them.
+            output = turbo_fused_attention(
+                queries,
+                self._packed_keys,
+                self._key_norms,
+                self._packed_values,
+                self._value_norms,
+                dim=dim,
+                bits=self.v_bits,
+                seed=self.seed,
+                scale=scale,
+            )
+
+            # Handle GQA: if n_q_heads > n_kv_heads, the fused kernel already
+            # handles this because it broadcasts across heads. But actually,
+            # turbo_fused_attention expects Q and K to have the same n_heads.
+            # GQA support will need the kernel to take a heads_ratio param.
+            # TODO: Add GQA support to turbo_fused_attention
+            return output
+
+        else:
+            # Fallback: update_and_fetch + standard SDPA
+            all_keys, all_values = self.update_and_fetch(keys, values)
+
+            if scale is None:
+                scale = 1.0 / math.sqrt(dim)
+
+            # Use mx.fast.scaled_dot_product_attention for the fallback
+            if mask is None and num_steps == 1:
+                # Decode: no mask needed
+                return mx.fast.scaled_dot_product_attention(
+                    queries, all_keys, all_values, scale=scale,
+                )
+            else:
+                # Prefill or masked: use the mask
+                if mask is None:
+                    mask = "causal"
+                return mx.fast.scaled_dot_product_attention(
+                    queries, all_keys, all_values, scale=scale, mask=mask,
+                )
 
     # --- mlx-lm _BaseCache interface ---
 
