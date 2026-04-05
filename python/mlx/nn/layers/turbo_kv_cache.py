@@ -504,6 +504,11 @@ class TurboQuantKVCache(Module):
         # key_bits <= 0 means keep keys at full precision
         self.k_bits = key_bits if key_bits is not None else bits
         self.seed = seed
+
+        # TURBO_BOUNDARY_LAYERS env var overrides the constructor arg
+        env_boundary = os.environ.get("TURBO_BOUNDARY_LAYERS")
+        if env_boundary is not None:
+            boundary_layers = int(env_boundary)
         self.boundary_layers = boundary_layers
         self.layer_idx = layer_idx
         self.num_layers = num_layers
