@@ -264,6 +264,18 @@ def turbo_encode(
     """
     dim = x.shape[-1]
 
+    # Try fused Metal kernel first (fastest path — single Metal dispatch)
+    # Toggle: set TURBO_DISABLE_FUSED_KERNEL=1 to force mx.compile path
+    use_fused = (
+        bits == 4
+        and dim <= 256
+        and (dim & (dim - 1)) == 0
+        and os.environ.get("TURBO_DISABLE_FUSED_KERNEL", "0") != "1"
+    )
+    if use_fused:
+        return turbo_encode_fused(x, bits=bits, seed=seed)
+
+    # Fallback: mx.compile path
     cache_key = (bits, dim, seed)
     if cache_key not in _compiled_encode_cache:
         _compiled_encode_cache[cache_key] = _make_compiled_encode(bits, dim, seed)
@@ -377,6 +389,17 @@ def turbo_decode(
         >>> x_hat = turbo_decode(packed, norms, dim=128, bits=4, seed=42)
         >>> x_hat.shape  # same as original x
     """
+    # Try fused Metal kernel first (fastest path — single Metal dispatch)
+    use_fused = (
+        bits == 4
+        and dim <= 256
+        and (dim & (dim - 1)) == 0
+        and os.environ.get("TURBO_DISABLE_FUSED_KERNEL", "0") != "1"
+    )
+    if use_fused:
+        return turbo_decode_fused(packed_indices, norms, dim, bits=bits, seed=seed)
+
+    # Fallback: Python graph path
     cb = _get_codebook(bits, dim)
 
     # 1. Unpack indices
@@ -400,6 +423,449 @@ def turbo_decode(
     x_reconstructed = x_unit * norms
 
     return x_reconstructed
+
+
+# ---------------------------------------------------------------------------
+# Fused Metal kernels for turbo encode / decode
+# ---------------------------------------------------------------------------
+# These eliminate Python graph construction overhead by running the entire
+# encode (norm→normalize→sign_flip→hadamard→quantize→pack) or decode
+# (unpack→lookup→hadamard→sign_flip→scale) pipeline as a single Metal
+# dispatch via mx.fast.metal_kernel.
+# ---------------------------------------------------------------------------
+
+_TURBO_ENCODE_HEADER = """
+// Fused turbo_encode Metal kernel
+// One threadgroup per vector. Each thread handles one element of the dim.
+//
+// Pipeline: norm → normalize → sign_flip → WHT butterfly → boundary quantize → pack
+//
+// Uses threadgroup shared memory for:
+//   1. WHT butterfly stages (in-place)
+//   2. Norm reduction
+//   3. Pack reduction (gather indices → uint32)
+
+// Inline boundary quantize: count how many boundaries the value exceeds
+inline uint boundary_quantize(float val, const device float* boundaries, uint n_boundaries) {
+    uint idx = 0;
+    for (uint i = 0; i < n_boundaries; i++) {
+        idx += (val > boundaries[i]) ? 1 : 0;
+    }
+    return idx;
+}
+"""
+
+_TURBO_ENCODE_SOURCE_4BIT = """
+    // Grid: (num_vectors * dim, 1, 1) — dim threads per vector
+    // Threadgroup: (dim, 1, 1) — one threadgroup = one vector
+    //
+    // Inputs:
+    //   x:          [num_vectors, dim]     — input vectors (float32)
+    //   signs:      [dim]                  — sign flip array {-1, +1}
+    //   boundaries: [15]                   — quantization boundaries (4-bit: 15)
+    //   params:     [3]                    — {dim, num_vectors, packed_dim}
+    //
+    // Outputs:
+    //   packed_out:  [num_vectors, packed_dim] — packed 4-bit indices (uint32)
+    //   norms_out:   [num_vectors]             — L2 norms
+
+    uint tid = thread_position_in_threadgroup.x;
+    uint vec_idx = threadgroup_position_in_grid.x;
+    uint dim = params[0];
+    uint num_vectors = params[1];
+    uint packed_dim = params[2];
+
+    if (vec_idx >= num_vectors || tid >= dim) return;
+
+    // Shared memory for WHT butterfly + norm reduction
+    threadgroup float shared_data[256];  // max dim=256
+    threadgroup float shared_norm[1];
+
+    // 1. Load input element
+    float val = x[vec_idx * dim + tid];
+
+    // 2. Compute L2 norm via threadgroup reduction
+    //    Each thread contributes val*val, then we do a tree reduction
+    shared_data[tid] = val * val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Tree reduction for sum of squares
+    for (uint stride = dim / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_data[tid] += shared_data[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        float norm = sqrt(shared_data[0]);
+        shared_norm[0] = max(norm, 1e-10f);
+        // Write norm output
+        norms_out[vec_idx] = norm;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float norm = shared_norm[0];
+
+    // 3. Normalize to unit sphere
+    val = val / norm;
+
+    // 4. Sign flip
+    val = val * signs[tid];
+
+    // 5. WHT butterfly (in-place via shared memory, double-buffered reads)
+    //    Hadamard with 1/sqrt(dim) normalization (orthonormal)
+    //    log2(dim) stages of butterfly operations
+    //    Each stage: read pair into registers, barrier, write result
+    shared_data[tid] = val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint log2_dim = 0;
+    for (uint d = dim; d > 1; d >>= 1) log2_dim++;
+
+    for (uint stage = 0; stage < log2_dim; stage++) {
+        uint half_block = 1u << stage;
+        uint block_size = half_block << 1;
+        uint block_idx = tid / block_size;
+        uint local_idx = tid % block_size;
+        uint base = block_idx * block_size;
+
+        // Read both operands into registers BEFORE any thread writes
+        float a = shared_data[base + (local_idx % half_block)];
+        float b = shared_data[base + (local_idx % half_block) + half_block];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Write: top half gets a+b, bottom half gets a-b
+        shared_data[tid] = (local_idx < half_block) ? (a + b) : (a - b);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Apply 1/sqrt(dim) normalization
+    float inv_sqrt_dim = rsqrt((float)dim);
+    float rotated = shared_data[tid] * inv_sqrt_dim;
+
+    // 6. Boundary quantize — 4-bit has 15 boundaries
+    uint idx = boundary_quantize(rotated, boundaries, 15);
+
+    // 7. Pack 4-bit indices into uint32 (8 indices per word)
+    //    Thread tid maps to word (tid / 8), position (tid % 8)
+    uint word_idx = tid / 8;
+    uint pos_in_word = tid % 8;
+
+    // Use shared memory to gather indices for packing
+    // Each thread atomically ORs its index into the correct word
+    threadgroup uint shared_packed[32];  // max packed_dim=32 (dim=256)
+    if (tid < packed_dim) {
+        shared_packed[tid] = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Atomic OR each thread's contribution into the packed word
+    // For 4-bit: shift index by (pos_in_word * 4) bits
+    uint shifted = idx << (pos_in_word * 4);
+
+    // Use atomic_fetch_or for thread-safe packing
+    // metal::atomic_fetch_or is not available on threadgroup memory in all cases,
+    // so we use a different approach: one thread per word gathers all 8 indices.
+
+    // Store index in shared memory at tid position
+    threadgroup uint shared_indices[256];
+    shared_indices[tid] = idx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // One thread per packed word gathers 8 indices and packs them
+    if (tid < packed_dim) {
+        uint packed_word = 0;
+        uint base = tid * 8;
+        for (uint i = 0; i < 8 && (base + i) < dim; i++) {
+            packed_word |= (shared_indices[base + i] & 0xF) << (i * 4);
+        }
+        packed_out[vec_idx * packed_dim + tid] = packed_word;
+    }
+"""
+
+_TURBO_DECODE_HEADER = """
+// Fused turbo_decode Metal kernel
+// One threadgroup per vector. Each thread handles one element of the dim.
+//
+// Pipeline: unpack → codebook lookup → WHT butterfly → sign_flip → scale by norm
+"""
+
+_TURBO_DECODE_SOURCE_4BIT = """
+    // Grid: (num_vectors * dim, 1, 1) — dim threads per vector
+    // Threadgroup: (dim, 1, 1) — one threadgroup = one vector
+    //
+    // Inputs:
+    //   packed_in:   [num_vectors, packed_dim] — packed 4-bit indices (uint32)
+    //   norms_in:    [num_vectors]             — L2 norms
+    //   centroids:   [16]                      — centroid lookup table
+    //   signs:       [dim]                     — sign flip array {-1, +1}
+    //   params:      [3]                       — {dim, num_vectors, packed_dim}
+    //
+    // Outputs:
+    //   x_out:       [num_vectors, dim]        — reconstructed vectors (float32)
+
+    uint tid = thread_position_in_threadgroup.x;
+    uint vec_idx = threadgroup_position_in_grid.x;
+    uint dim = params[0];
+    uint num_vectors = params[1];
+    uint packed_dim = params[2];
+
+    if (vec_idx >= num_vectors || tid >= dim) return;
+
+    // Shared memory for WHT butterfly
+    threadgroup float shared_data[256];  // max dim=256
+
+    // 1. Unpack: extract 4-bit index for this thread's position
+    uint word_idx = tid / 8;
+    uint pos_in_word = tid % 8;
+    uint packed_word = packed_in[vec_idx * packed_dim + word_idx];
+    uint idx = (packed_word >> (pos_in_word * 4)) & 0xF;
+
+    // 2. Codebook lookup
+    float val = centroids[idx];
+
+    // 3. Inverse WHT butterfly (Hadamard is self-inverse up to scaling)
+    //    Double-buffered: read pair → barrier → write result → barrier
+    shared_data[tid] = val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint log2_dim = 0;
+    for (uint d = dim; d > 1; d >>= 1) log2_dim++;
+
+    for (uint stage = 0; stage < log2_dim; stage++) {
+        uint half_block = 1u << stage;
+        uint block_size = half_block << 1;
+        uint block_idx = tid / block_size;
+        uint local_idx = tid % block_size;
+        uint base = block_idx * block_size;
+
+        float a = shared_data[base + (local_idx % half_block)];
+        float b = shared_data[base + (local_idx % half_block) + half_block];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        shared_data[tid] = (local_idx < half_block) ? (a + b) : (a - b);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_sqrt_dim = rsqrt((float)dim);
+    float rotated = shared_data[tid] * inv_sqrt_dim;
+
+    // 4. Inverse sign flip (signs are self-inverse)
+    rotated = rotated * signs[tid];
+
+    // 5. Scale by norm
+    float norm = norms_in[vec_idx];
+    x_out[vec_idx * dim + tid] = rotated * norm;
+"""
+
+
+def _get_turbo_encode_kernel(bits: int):
+    """Get or create the fused encode Metal kernel.
+
+    Args:
+        bits: Quantization bit-width (currently only 4-bit supported).
+
+    Returns:
+        Compiled Metal kernel callable.
+    """
+    cache_key = f"turbo_encode_{bits}bit"
+    if cache_key in _kernel_cache:
+        return _kernel_cache[cache_key]
+
+    if bits != 4:
+        raise NotImplementedError(
+            f"Fused encode kernel not yet implemented for {bits}-bit. "
+            "Use turbo_encode() (Python graph) instead."
+        )
+
+    kernel = mx.fast.metal_kernel(
+        name=f"turbo_encode_{bits}bit",
+        input_names=["x", "signs", "boundaries", "params"],
+        output_names=["packed_out", "norms_out"],
+        header=_TURBO_ENCODE_HEADER,
+        source=_TURBO_ENCODE_SOURCE_4BIT,
+        ensure_row_contiguous=True,
+        atomic_outputs=False,
+    )
+
+    _kernel_cache[cache_key] = kernel
+    return kernel
+
+
+def _get_turbo_decode_kernel(bits: int):
+    """Get or create the fused decode Metal kernel.
+
+    Args:
+        bits: Quantization bit-width (currently only 4-bit supported).
+
+    Returns:
+        Compiled Metal kernel callable.
+    """
+    cache_key = f"turbo_decode_{bits}bit"
+    if cache_key in _kernel_cache:
+        return _kernel_cache[cache_key]
+
+    if bits != 4:
+        raise NotImplementedError(
+            f"Fused decode kernel not yet implemented for {bits}-bit. "
+            "Use turbo_decode() (Python graph) instead."
+        )
+
+    kernel = mx.fast.metal_kernel(
+        name=f"turbo_decode_{bits}bit",
+        input_names=["packed_in", "norms_in", "centroids", "signs", "params"],
+        output_names=["x_out"],
+        header=_TURBO_DECODE_HEADER,
+        source=_TURBO_DECODE_SOURCE_4BIT,
+        ensure_row_contiguous=True,
+        atomic_outputs=False,
+    )
+
+    _kernel_cache[cache_key] = kernel
+    return kernel
+
+
+# Cache for pre-computed sign flip vectors (avoid regenerating each call)
+_sign_cache: Dict[Tuple[int, int], mx.array] = {}
+
+
+def _get_signs(dim: int, seed: int) -> mx.array:
+    """Get cached sign flip vector."""
+    key = (dim, seed)
+    if key not in _sign_cache:
+        _sign_cache[key] = _sign_flip_vector(dim, seed)
+    return _sign_cache[key]
+
+
+def turbo_encode_fused(
+    x: mx.array,
+    bits: int = 4,
+    seed: int = 42,
+) -> Tuple[mx.array, mx.array]:
+    """Fused Metal kernel encode — single dispatch replaces ~8 graph nodes.
+
+    Runs the full encode pipeline (norm → normalize → sign_flip → WHT →
+    boundary quantize → pack) as one Metal kernel, eliminating Python graph
+    construction overhead that dominates small-batch decode latency.
+
+    Falls back to turbo_encode() for non-4-bit or non-power-of-2 dims.
+
+    Args:
+        x: Input tensor of shape (..., dim). dim must be power of 2, max 256.
+        bits: Quantization bit-width. Default: 4 (only 4-bit fused kernel).
+        seed: Random seed for the sign-flip diagonal. Default: 42.
+
+    Returns:
+        Tuple of (packed_indices, norms) — same format as turbo_encode().
+
+    Example:
+        >>> x = mx.random.normal((1, 8, 1, 128))
+        >>> packed, norms = turbo_encode_fused(x, bits=4)
+        >>> packed.shape  # (1, 8, 1, 16)
+        >>> norms.shape   # (1, 8, 1)
+    """
+    dim = x.shape[-1]
+
+    # Fallback for unsupported configs
+    if bits != 4 or dim > 256 or (dim & (dim - 1)) != 0:
+        return turbo_encode(x, bits=bits, seed=seed)
+
+    kernel = _get_turbo_encode_kernel(bits)
+    cb = _get_codebook(bits, dim)
+    signs = _get_signs(dim, seed)
+
+    # Flatten to (num_vectors, dim)
+    leading_shape = x.shape[:-1]
+    num_vectors = 1
+    for s in leading_shape:
+        num_vectors *= s
+
+    x_flat = x.reshape(num_vectors, dim).astype(mx.float32)
+    packed_dim = dim // 8  # 4-bit: 8 indices per uint32
+
+    params = mx.array([dim, num_vectors, packed_dim], dtype=mx.uint32)
+
+    outputs = kernel(
+        inputs=[x_flat, signs, cb.boundaries, params],
+        output_shapes=[
+            (num_vectors, packed_dim),  # packed_out
+            (num_vectors,),             # norms_out
+        ],
+        output_dtypes=[mx.uint32, mx.float32],
+        grid=(num_vectors * dim, 1, 1),  # total threads = num_vectors * dim
+        threadgroup=(dim, 1, 1),          # one threadgroup per vector
+        init_value=0,
+        stream=mx.gpu,
+    )
+
+    packed = outputs[0].reshape(*leading_shape, packed_dim)
+    norms = outputs[1].reshape(*leading_shape, 1)
+
+    return packed, norms
+
+
+def turbo_decode_fused(
+    packed_indices: mx.array,
+    norms: mx.array,
+    dim: int,
+    bits: int = 4,
+    seed: int = 42,
+) -> mx.array:
+    """Fused Metal kernel decode — single dispatch replaces ~6 graph nodes.
+
+    Runs the full decode pipeline (unpack → codebook lookup → WHT → sign_flip
+    → scale) as one Metal kernel.
+
+    Falls back to turbo_decode() for non-4-bit or non-power-of-2 dims.
+
+    Args:
+        packed_indices: uint32 tensor from turbo_encode. Shape (..., packed_dim).
+        norms: float32 norms from turbo_encode. Shape (..., 1).
+        dim: Original head dimension.
+        bits: Quantization bit-width. Default: 4.
+        seed: Must match the seed used in turbo_encode. Default: 42.
+
+    Returns:
+        Reconstructed tensor of shape (..., dim).
+
+    Example:
+        >>> packed, norms = turbo_encode_fused(x, bits=4)
+        >>> x_hat = turbo_decode_fused(packed, norms, dim=128)
+    """
+    # Fallback for unsupported configs
+    if bits != 4 or dim > 256 or (dim & (dim - 1)) != 0:
+        return turbo_decode(packed_indices, norms, dim, bits=bits, seed=seed)
+
+    kernel = _get_turbo_decode_kernel(bits)
+    cb = _get_codebook(bits, dim)
+    signs = _get_signs(dim, seed)
+
+    packed_dim = dim // 8
+    leading_shape = packed_indices.shape[:-1]
+    num_vectors = 1
+    for s in leading_shape:
+        num_vectors *= s
+
+    packed_flat = packed_indices.reshape(num_vectors, packed_dim).astype(mx.uint32)
+    # Flatten norms — handle both (..., 1) and (...,) shapes
+    norms_flat = norms.reshape(num_vectors).astype(mx.float32)
+
+    params = mx.array([dim, num_vectors, packed_dim], dtype=mx.uint32)
+
+    outputs = kernel(
+        inputs=[packed_flat, norms_flat, cb.centroids, signs, params],
+        output_shapes=[
+            (num_vectors, dim),  # x_out
+        ],
+        output_dtypes=[mx.float32],
+        grid=(num_vectors * dim, 1, 1),  # total threads = num_vectors * dim
+        threadgroup=(dim, 1, 1),          # one threadgroup per vector
+        init_value=0,
+        stream=mx.gpu,
+    )
+
+    return outputs[0].reshape(*leading_shape, dim)
 
 
 # ---------------------------------------------------------------------------
