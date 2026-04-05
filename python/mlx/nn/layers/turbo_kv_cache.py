@@ -487,6 +487,96 @@ def turbo_attention(
 
 
 # ---------------------------------------------------------------------------
+# Model-aware config recommendation (moe-v-compression-frontier.md)
+# ---------------------------------------------------------------------------
+
+
+def recommend_config(
+    model_type: str,
+    head_dim: int,
+    num_layers: int,
+) -> Dict[str, Union[int, str, bool]]:
+    """Suggest optimal TurboQuant config based on model architecture.
+
+    From moe-v-compression-frontier.md: MoE models have a higher fraction of
+    attention in their total decode compute (15-30%) because only a few experts
+    are active per token, making FFN cheaper. Dense models have attention at <5%
+    of decode — KV compression saves memory but barely affects speed.
+
+    This means TurboQuant compression has MORE speed impact on MoE models, and
+    more aggressive quantization (symmetric turbo3/turbo4) is worthwhile.
+
+    Args:
+        model_type: One of "dense", "moe", or "small" (<3B params).
+        head_dim: Head dimension (e.g. 64, 128, 256).
+        num_layers: Total number of transformer layers.
+
+    Returns:
+        Dict with recommended config keys:
+            - bits: V quantization bit-width
+            - key_bits: K quantization bit-width (0 = FP16)
+            - symmetric: Whether K and V use same quantization
+            - rationale: Human-readable explanation
+            - speed_benefit: Expected speed improvement category
+
+    Example:
+        >>> recommend_config("moe", 128, 32)
+        {'bits': 4, 'key_bits': 4, 'symmetric': True, ...}
+        >>> recommend_config("dense", 128, 32)
+        {'bits': 4, 'key_bits': 0, 'symmetric': False, ...}
+    """
+    model_type = model_type.lower().strip()
+
+    if model_type == "small":
+        # Small models (<3B): overhead of per-layer encode/decode may
+        # outweigh the savings. Memory benefit exists but speed may regress.
+        return {
+            "bits": 4,
+            "key_bits": 0,
+            "symmetric": False,
+            "boundary_layers": 1,
+            "rationale": (
+                "Small models (<3B): per-layer encode/decode overhead is a "
+                "larger fraction of total compute. Use asymmetric (K=FP16, "
+                "V=turbo4) for memory savings only. Speed benefit unlikely."
+            ),
+            "speed_benefit": "minimal",
+        }
+    elif model_type == "moe":
+        # MoE: attention is 15-30% of decode (only a few experts active).
+        # Symmetric turbo4 recommended — speed benefit is meaningful.
+        return {
+            "bits": 4,
+            "key_bits": 4,
+            "symmetric": True,
+            "boundary_layers": 2,
+            "rationale": (
+                "MoE models: attention is 15-30% of decode compute (FFN is "
+                "cheap with sparse expert routing). Symmetric turbo4 gives "
+                "both memory AND speed benefits. turbo3 is viable for "
+                "aggressive compression. (moe-v-compression-frontier.md)"
+            ),
+            "speed_benefit": "significant",
+        }
+    else:
+        # Dense: attention is <5% of decode. KV compression helps memory
+        # but speed improvement is negligible.
+        return {
+            "bits": 4,
+            "key_bits": 0,
+            "symmetric": False,
+            "boundary_layers": 2,
+            "rationale": (
+                "Dense models: attention is <5% of decode — FFN dominates. "
+                "KV compression saves memory but speed benefit is minimal. "
+                "Asymmetric (K=FP16, V=turbo4) recommended for best quality "
+                "per byte. (moe-v-compression-frontier.md)"
+            ),
+            "speed_benefit": "minimal",
+        }
+
+
+# ---------------------------------------------------------------------------
 # TurboQuantKVCache — the main cache module
 # ---------------------------------------------------------------------------
 
