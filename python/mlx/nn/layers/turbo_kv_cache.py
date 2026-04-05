@@ -85,6 +85,12 @@ class TurboQuantCodebook:
 
     Boundaries are midpoints between adjacent centroids.
 
+    **Design choice — pure centroid quantization, no residual correction:**
+    QJL (random Gaussian projection for residual) was tested and found actively
+    harmful for autoregressive generation (turbo4-resurrection.md). Variance from
+    the random projection compounds across decode steps. 16 centroids (4-bit)
+    without correction outperform 8 centroids (3-bit) with correction.
+
     Args:
         bits (int): Quantization bit-width (2, 3, or 4).
         dim (int): Head dimension (e.g. 64, 128, 256). Must be power of 2.
@@ -223,7 +229,18 @@ def turbo_encode(
     # the same 32-wide sweet spot as ARM NEON in llama.cpp.
     x_rotated = mx.hadamard_transform(x_flipped)
 
-    # 4. Boundary quantize → indices
+    # 4. Boundary quantize → indices (pure centroid, NO residual correction)
+    #
+    # CONFIRMED: No QJL (random Gaussian projection) residual correction.
+    # From turbo4-resurrection.md: QJL is actively harmful for autoregressive
+    # generation — variance from the random projection compounds across decode
+    # steps, degrading output quality progressively. Pure centroid quantization
+    # without correction is strictly better for inference.
+    #
+    # Also confirmed: 16 centroids (4-bit) dramatically outperform 8-centroid
+    # (3-bit) schemes even WITH residual correction. Our 4-bit default is the
+    # correct choice — more centroids > fewer centroids + correction.
+    #
     # For each element, find which centroid bin it falls into using boundaries.
     # boundaries shape: (n_levels - 1,)
     # x_rotated shape: (..., dim)
