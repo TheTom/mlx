@@ -171,6 +171,67 @@ def _sign_flip_vector(dim: int, seed: int) -> mx.array:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Compiled encode pipeline cache — keyed by (bits, dim, seed) to avoid
+# recompilation. mx.compile fuses the MLX graph into a single Metal dispatch,
+# eliminating kernel launch overhead between normalize → sign_flip → WHT →
+# quantize → pack. The sign_flip multiply is absorbed into the WHT launch.
+# ---------------------------------------------------------------------------
+_compiled_encode_cache: Dict[Tuple[int, int, int], object] = {}
+
+
+def _make_compiled_encode(bits: int, dim: int, seed: int):
+    """Create a compiled (fused) encode function for given (bits, dim, seed).
+
+    The compiled function fuses: norm → normalize → sign_flip → hadamard →
+    boundary_quantize → pack into a single MLX graph evaluation. This
+    eliminates per-op kernel launch overhead (5-7 Metal dispatches → 1).
+
+    Falls back gracefully if mx.compile is not available or fails.
+
+    Args:
+        bits: Quantization bit-width.
+        dim: Head dimension.
+        seed: SRHT random seed.
+
+    Returns:
+        Compiled callable that takes x and returns (packed, norms).
+    """
+    cb = _get_codebook(bits, dim)
+    signs = _sign_flip_vector(dim, seed)
+    boundaries = cb.boundaries
+
+    def _encode_inner(x):
+        # 1. Norms + normalize
+        norms = mx.linalg.norm(x, axis=-1, keepdims=True)
+        safe_norms = mx.maximum(norms, mx.array(1e-10))
+        x_unit = x / safe_norms
+
+        # 2. Sign flip + WHT (fused: single element-wise multiply before WHT)
+        # Since sign_flip is just element-wise ±1 multiply, MLX's compiler
+        # can fuse this with the hadamard_transform input read.
+        x_rotated = mx.hadamard_transform(x_unit * signs)
+
+        # 3. Boundary quantize
+        indices = mx.sum(
+            mx.expand_dims(x_rotated, axis=-1) > mx.expand_dims(boundaries, axis=0),
+            axis=-1,
+        ).astype(mx.uint32)
+
+        # 4. Pack into uint32
+        packed = _pack_indices(indices, bits)
+
+        return packed, norms
+
+    try:
+        compiled_fn = mx.compile(_encode_inner)
+        return compiled_fn
+    except Exception:
+        # mx.compile may not be available in all MLX versions
+        # Fall back to uncompiled
+        return _encode_inner
+
+
 def turbo_encode(
     x: mx.array,
     bits: int = 4,
@@ -178,7 +239,11 @@ def turbo_encode(
 ) -> Tuple[mx.array, mx.array]:
     """Encode vectors using TurboQuant (SRHT + Lloyd-Max quantization).
 
-    Applies: normalize → sign_flip → hadamard_transform → boundary quantize → pack.
+    Applies: normalize → sign_flip → hadamard_transform �� boundary quantize → pack.
+
+    Uses ``mx.compile()`` to fuse the full pipeline into a single Metal dispatch,
+    eliminating per-op kernel launch overhead. The compiled function is cached
+    per (bits, dim, seed) triple.
 
     Args:
         x: Input tensor of shape (..., dim). dim must be power of 2.
@@ -196,6 +261,33 @@ def turbo_encode(
         >>> packed, norms = turbo_encode(x, bits=4, seed=42)
         >>> packed.shape  # (4, 8, 16) — 128 * 4 / 32 = 16 uint32s
         >>> norms.shape   # (4, 8, 1)
+    """
+    dim = x.shape[-1]
+
+    cache_key = (bits, dim, seed)
+    if cache_key not in _compiled_encode_cache:
+        _compiled_encode_cache[cache_key] = _make_compiled_encode(bits, dim, seed)
+
+    return _compiled_encode_cache[cache_key](x)
+
+
+def turbo_encode_uncompiled(
+    x: mx.array,
+    bits: int = 4,
+    seed: int = 42,
+) -> Tuple[mx.array, mx.array]:
+    """Uncompiled encode path — for benchmarking against compiled version.
+
+    Identical to the original turbo_encode without mx.compile fusion.
+    Used as baseline to measure the compile optimization speedup.
+
+    Args:
+        x: Input tensor of shape (..., dim). dim must be power of 2.
+        bits: Quantization bit-width (2, 3, or 4). Default: 4.
+        seed: Random seed for the sign-flip diagonal. Default: 42.
+
+    Returns:
+        Same as turbo_encode: (packed_indices, norms).
     """
     dim = x.shape[-1]
     cb = _get_codebook(bits, dim)
