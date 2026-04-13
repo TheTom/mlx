@@ -297,6 +297,37 @@ void init_fast(nb::module_& parent_module) {
       )pbdoc");
 
   m.def(
+      "scaled_dot_product_attention_qv_cb",
+      [](const mx::array& queries,
+         const mx::array& keys,
+         const mx::array& v_packed,
+         const mx::array& v_norms,
+         const mx::array& v_codebook,
+         float scale,
+         int bits,
+         mx::StreamOrDevice s) {
+        return mx::fast::scaled_dot_product_attention_qv_cb(
+            queries, keys, v_packed, v_norms, v_codebook,
+            scale, bits, s);
+      },
+      "q"_a,
+      "k"_a,
+      "v_packed"_a,
+      "v_norms"_a,
+      "v_codebook"_a,
+      nb::kw_only(),
+      "scale"_a,
+      "bits"_a = 4,
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def scaled_dot_product_attention_qv_cb(q: array, k: array, v_packed: array, v_norms: array, v_codebook: array, *, scale: float, bits: int = 4, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Fused SDPA with TurboQuant codebook-quantized V.
+        K stays fp16 for scoring. V dequantized inline as codebook[index] * norm.
+        Supports 2, 3, 4-bit V. Prefill (L>1) via steel flash attention.
+      )pbdoc");
+
+  m.def(
       "scaled_dot_product_attention_qv",
       &mx::fast::scaled_dot_product_attention_qv,
       "q"_a,

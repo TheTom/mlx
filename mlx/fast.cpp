@@ -922,6 +922,40 @@ bool ScaledDotProductAttentionVJP::is_equivalent(const Primitive& other) const {
       has_sinks_ == a_other.has_sinks_;
 }
 
+array scaled_dot_product_attention_qv_cb(
+    const array& queries,
+    const array& keys,
+    const array& v_packed,
+    const array& v_norms,
+    const array& v_codebook,
+    const float scale,
+    int bits,
+    StreamOrDevice s) {
+  if (queries.ndim() != 4 || keys.ndim() != 4) {
+    throw std::invalid_argument(
+        "[scaled_dot_product_attention_qv_cb] queries/keys expected rank 4");
+  }
+
+  int D = queries.shape(-1);
+  auto final_type = queries.dtype();
+  auto q = astype(queries, final_type, s);
+  auto k = astype(keys, final_type, s);
+
+  auto fallback = [](const std::vector<array>& inputs) -> std::vector<array> {
+    throw std::runtime_error(
+        "[scaled_dot_product_attention_qv_cb] CPU fallback NYI");
+    return {};
+  };
+
+  auto stream = to_stream(s);
+  std::vector<array> inputs = {q, k, v_packed, v_norms, v_codebook};
+
+  Shape out_shape{q.shape(0), q.shape(1), q.shape(2), D};
+  auto primitive = std::make_shared<ScaledDotProductAttentionQVCB>(
+      stream, fallback, scale, bits);
+  return array(std::move(out_shape), final_type, primitive, std::move(inputs));
+}
+
 /** Computes: O = softmax(Q @ K.T) @ dequant(V)
  *  Quantized-V variant for decode (L=1). */
 array scaled_dot_product_attention_qv(
@@ -953,13 +987,8 @@ array scaled_dot_product_attention_qv(
         "expected to be rank 4");
   }
 
-  // Decode only: L must be 1
-  if (queries.shape(2) != 1) {
-    std::ostringstream msg;
-    msg << "[scaled_dot_product_attention_qv] only L=1 (decode) supported, "
-        << "got L=" << queries.shape(2);
-    throw std::invalid_argument(msg.str());
-  }
+  // sdpa_vector_qv handles L>1 natively via grid.y = L
+  // (one threadgroup per query position, parallel across GPU)
 
   // Batch dims must match
   if (queries.shape(0) != keys.shape(0)) {
@@ -986,21 +1015,18 @@ array scaled_dot_product_attention_qv(
     throw std::invalid_argument(msg.str());
   }
 
-  // Validate qv_data shape: [B, n_kv, N, D/el_per_int]
-  // 4-bit: 8 elements per uint32 → D/8
-  // 8-bit: 4 elements per uint32 → D/4
-  int el_per_int = 32 / group_size == 2 ? 4 : 8;  // group_size=64 → 8-bit, group_size=32 → 4-bit
-  if (group_size == 64) el_per_int = 4;  // 8-bit: 4 per uint32
-  else el_per_int = 8;                   // 4-bit: 8 per uint32
-  int expected_packed_dim = D / el_per_int;
+  // Validate qv_data shape: [B, n_kv, N, packed_dim]
+  // Infer bits from packed_dim: packed_dim = D * bits / 32
+  // Accept any valid packing: 2-bit (D/16), 3-bit (D*3/32), 4-bit (D/8), 8-bit (D/4)
+  int packed_dim_actual = qv_data.shape(-1);
+  // Compute expected packed dim for the given D (rounded up)
+  // We accept it as-is — the kernel will unpack based on BITS template param
   int N = keys.shape(2);
   if (qv_data.shape(0) != queries.shape(0) ||
-      qv_data.shape(1) != n_kv_heads || qv_data.shape(2) != N ||
-      qv_data.shape(3) != expected_packed_dim) {
+      qv_data.shape(1) != n_kv_heads || qv_data.shape(2) != N) {
     std::ostringstream msg;
     msg << "[scaled_dot_product_attention_qv] qv_data shape " << qv_data.shape()
-        << " expected [" << queries.shape(0) << ", " << n_kv_heads << ", " << N
-        << ", " << expected_packed_dim << "]";
+        << " batch/heads/seq mismatch with queries/keys";
     throw std::invalid_argument(msg.str());
   }
 
@@ -1039,6 +1065,11 @@ array scaled_dot_product_attention_qv(
   auto q = astype(queries, final_type, s);
   auto k = astype(keys, final_type, s);
 
+  // Metal kernel reads scales/biases as device float*.
+  // mx.quantize returns them in w.dtype() (often fp16). Cast to float32.
+  auto qv_s = qv_scales.dtype() != float32 ? astype(qv_scales, float32, s) : qv_scales;
+  auto qv_b = qv_biases.dtype() != float32 ? astype(qv_biases, float32, s) : qv_biases;
+
   // Fallback: dequantize V via mx.dequantize and use regular SDPA
   // TODO: implement a proper CPU fallback with inline dequant
   auto fallback =
@@ -1069,7 +1100,7 @@ array scaled_dot_product_attention_qv(
       };
 
   auto stream = to_stream(s);
-  std::vector<array> inputs = {q, k, qv_data, qv_scales, qv_biases};
+  std::vector<array> inputs = {q, k, qv_data, qv_s, qv_b};
 
   // Only GPU path supported, and only for L=1 decode
   if (stream.device == Device::cpu) {

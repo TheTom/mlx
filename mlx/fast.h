@@ -57,6 +57,16 @@ MLX_API array scaled_dot_product_attention(
 /** Computes: O = softmax(Q @ K.T) @ dequant(V)
  *  Quantized-V variant: K is FP16, V is 4-bit packed uint32.
  *  Decode-only (L=1). */
+MLX_API array scaled_dot_product_attention_qv_cb(
+    const array& queries,
+    const array& keys,
+    const array& v_packed,
+    const array& v_norms,
+    const array& v_codebook,
+    const float scale,
+    int bits = 4,
+    StreamOrDevice s = {});
+
 MLX_API array scaled_dot_product_attention_qv(
     const array& queries,
     const array& keys,

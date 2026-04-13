@@ -9,6 +9,8 @@
 #include "mlx/backend/metal/kernels/steel/attn/params.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/fast_primitives.h"
+#include "mlx/fast.h"
+#include "mlx/ops.h"
 #include "mlx/utils.h"
 
 namespace mlx::core::fast {
@@ -867,81 +869,294 @@ void ScaledDotProductAttentionQV::eval_gpu(
   }
 
   int D = q.shape(-1);
-
-  // Build kernel name: "sdpa_vector_qv[8]_{type}_{D}"
-  std::string kname;
-  kname.reserve(64);
-  if (group_size_ == 64) {
-    kname += "sdpa_vector_qv8_";
-  } else {
-    kname += "sdpa_vector_qv_";
-  }
-  kname += get_type_string(q.dtype());
-  kname += "_";
-  kname += std::to_string(D);
-
-  // Compute strides and sizes
+  int L = q.shape(2);
   int gqa_factor = q.shape(1) / k.shape(1);
   int N = k.shape(2);
-  size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
-  size_t k_seq_stride = k.strides()[2];
 
-  // V data strides (in uint32 words)
+  // V data strides
   size_t qv_data_head_stride =
       qv_data.shape(1) == 1 ? qv_data.strides(0) : qv_data.strides(1);
-  size_t qv_data_seq_stride = qv_data.strides()[2];
-
-  // V scales/biases strides (in floats)
   size_t qv_group_head_stride =
       qv_scales.shape(1) == 1 ? qv_scales.strides(0) : qv_scales.strides(1);
-  size_t qv_group_seq_stride = qv_scales.strides()[2];
 
-  // Function constants — reuse the same IDs as sdpa_vector
-  bool has_mask = false;
-  bool query_transposed = !q.flags().row_contiguous;
-  bool do_causal = false;
-  bool bool_mask = false;
-  bool float_mask = false;
-  bool has_sinks = false;
-  metal::MTLFCList func_consts = {
-      {&has_mask, MTL::DataType::DataTypeBool, 20},
-      {&query_transposed, MTL::DataType::DataTypeBool, 21},
-      {&do_causal, MTL::DataType::DataTypeBool, 22},
-      {&bool_mask, MTL::DataType::DataTypeBool, 23},
-      {&float_mask, MTL::DataType::DataTypeBool, 24},
-      {&has_sinks, MTL::DataType::DataTypeBool, 25},
-  };
-  std::string hash_name = kname;
-  hash_name += query_transposed ? "_qt" : "_qnt";
-
-  // Get the kernel
   auto& compute_encoder = metal::get_command_encoder(s);
-  auto kernel = d.get_kernel(kname, hash_name, func_consts);
-  compute_encoder.set_compute_pipeline_state(kernel);
 
-  // Set arguments matching the Metal kernel signature
-  compute_encoder.set_input_array(q, 0);           // queries
-  compute_encoder.set_input_array(k, 1);            // keys
-  compute_encoder.set_input_array(qv_data, 2);      // qv_data (uint*)
-  compute_encoder.set_input_array(qv_scales, 3);    // qv_scales (float*)
-  compute_encoder.set_input_array(qv_biases, 4);    // qv_biases (float*)
-  compute_encoder.set_output_array(o, 5);            // out
-  compute_encoder.set_bytes(gqa_factor, 6);
-  compute_encoder.set_bytes(N, 7);
-  compute_encoder.set_bytes(k_head_stride, 8);
-  compute_encoder.set_bytes(k_seq_stride, 9);
-  compute_encoder.set_bytes(qv_data_head_stride, 10);
-  compute_encoder.set_bytes(qv_data_seq_stride, 11);
-  compute_encoder.set_bytes(qv_group_head_stride, 12);
-  compute_encoder.set_bytes(qv_group_seq_stride, 13);
-  compute_encoder.set_bytes(scale_, 14);
+  // Determine bit width from group_size
+  int bits = (group_size_ == 64) ? 8 : 4;
+  // Override for explicit 2-bit and 3-bit (group_size=32 used for 2,3,4-bit)
+  // Detect from packed_per_row: bits = D * bits_actual / (packed_per_row * 32)
+  // For now, derive from qv_data shape: packed_dim = D * bits / 32
+  int packed_dim = qv_data.shape(-1);
+  int bits_from_shape = (packed_dim * 32 + D - 1) / D;
+  if (bits_from_shape >= 2 && bits_from_shape <= 8) bits = bits_from_shape;
 
-  // Launch: same grid as sdpa_vector for L=1
-  MTL::Size group_dims(1024, 1, 1);
-  MTL::Size grid_dims(q.shape(0) * q.shape(1), q.shape(2), 1);
-  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  // Steel prefill supports: float16, power-of-2 bits {2,4,8}, D in {64,128,256}
+  // 3-bit uses non-standard packing in mx.quantize — falls back to decode kernel
+  bool steel_supported = (q.dtype() == float16) &&
+      (bits == 2 || bits == 4 || bits == 8) &&
+      (D == 64 || D == 128 || D == 256);
+
+  if (L <= 8 || !steel_supported) {
+    // === Decode path (or unsupported prefill fallback): sdpa_vector_qv ===
+    std::string kname;
+    kname.reserve(64);
+    if (group_size_ == 64) {
+      kname += "sdpa_vector_qv8_";
+    } else {
+      kname += "sdpa_vector_qv_";
+    }
+    kname += get_type_string(q.dtype());
+    kname += "_";
+    kname += std::to_string(D);
+
+    size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
+    size_t k_seq_stride = k.strides()[2];
+    size_t qv_data_seq_stride = qv_data.strides()[2];
+    size_t qv_group_seq_stride = qv_scales.strides()[2];
+
+    bool has_mask = false;
+    bool query_transposed = !q.flags().row_contiguous;
+    bool do_causal = false;
+    bool bool_mask = false;
+    bool float_mask = false;
+    bool has_sinks = false;
+    metal::MTLFCList func_consts = {
+        {&has_mask, MTL::DataType::DataTypeBool, 20},
+        {&query_transposed, MTL::DataType::DataTypeBool, 21},
+        {&do_causal, MTL::DataType::DataTypeBool, 22},
+        {&bool_mask, MTL::DataType::DataTypeBool, 23},
+        {&float_mask, MTL::DataType::DataTypeBool, 24},
+        {&has_sinks, MTL::DataType::DataTypeBool, 25},
+    };
+    std::string hash_name = kname;
+    hash_name += query_transposed ? "_qt" : "_qnt";
+
+    auto kernel = d.get_kernel(kname, hash_name, func_consts);
+    compute_encoder.set_compute_pipeline_state(kernel);
+
+    compute_encoder.set_input_array(q, 0);
+    compute_encoder.set_input_array(k, 1);
+    compute_encoder.set_input_array(qv_data, 2);
+    compute_encoder.set_input_array(qv_scales, 3);
+    compute_encoder.set_input_array(qv_biases, 4);
+    compute_encoder.set_output_array(o, 5);
+    compute_encoder.set_bytes(gqa_factor, 6);
+    compute_encoder.set_bytes(N, 7);
+    compute_encoder.set_bytes(k_head_stride, 8);
+    compute_encoder.set_bytes(k_seq_stride, 9);
+    compute_encoder.set_bytes(qv_data_head_stride, 10);
+    compute_encoder.set_bytes(qv_data_seq_stride, 11);
+    compute_encoder.set_bytes(qv_group_head_stride, 12);
+    compute_encoder.set_bytes(qv_group_seq_stride, 13);
+    compute_encoder.set_bytes(scale_, 14);
+
+    MTL::Size group_dims(1024, 1, 1);
+    MTL::Size grid_dims(q.shape(0) * q.shape(1), q.shape(2), 1);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  } else {
+    // Steel prefill path
+    using namespace mlx::steel;
+
+    int B_size = q.shape(0);
+    int H_size = q.shape(1);
+    int BQ = 32;
+    int BK = D <= 128 ? 32 : 16;
+    int WM = 4;
+    int WN = 1;
+
+    std::string kname;
+    kname.reserve(128);
+    kname += "attention_qv_";
+    kname += get_type_string(q.dtype());
+    kname += "_bq" + std::to_string(BQ);
+    kname += "_bk" + std::to_string(BK);
+    kname += "_bd" + std::to_string(D);
+    kname += "_wm" + std::to_string(WM);
+    kname += "_wn" + std::to_string(WN);
+    kname += "_b" + std::to_string(bits);
+
+    bool align_Q_val = (L % BQ) == 0;
+    bool align_K_val = (N % BK) == 0;
+    bool has_mask_val = false;
+    bool do_causal_val = false;
+    metal::MTLFCList func_consts = {
+        {&align_Q_val, MTL::DataType::DataTypeBool, 200},
+        {&align_K_val, MTL::DataType::DataTypeBool, 201},
+        {&has_mask_val, MTL::DataType::DataTypeBool, 300},
+        {&do_causal_val, MTL::DataType::DataTypeBool, 301},
+    };
+    std::string hash_name = kname;
+    hash_name += align_Q_val ? "_aQ" : "_nQ";
+    hash_name += align_K_val ? "_aK" : "_nK";
+
+    auto kernel = d.get_kernel(kname, hash_name, func_consts);
+    compute_encoder.set_compute_pipeline_state(kernel);
+
+    int NQ = (L + BQ - 1) / BQ;
+    int NK = (N + BK - 1) / BK;
+
+    // Q strides: (B, H_q, L, D)
+    AttnParams attn_params{
+        /* B = */ B_size,
+        /* H = */ H_size,
+        /* D = */ D,
+        /* qL = */ L,
+        /* kL = */ N,
+        /* gqa_factor = */ gqa_factor,
+        /* scale = */ scale_,
+        /* NQ = */ NQ,
+        /* NK = */ NK,
+        /* NQ_aligned = */ L / BQ,
+        /* NK_aligned = */ N / BK,
+        /* qL_rem = */ L - (L / BQ) * BQ,
+        /* kL_rem = */ N - (N / BK) * BK,
+        /* qL_off = */ N - L,
+        /* Q_strides = */ {q.strides(0), q.strides(1), q.strides(2)},
+        /* K_strides = */ {k.strides(0), k.strides(1), k.strides(2)},
+        /* V_strides = */ {0, 0, 0},
+        /* O_strides = */ {o.strides(0), o.strides(1), o.strides(2)},
+    };
+
+    compute_encoder.set_input_array(q, 0);
+    compute_encoder.set_input_array(k, 1);
+    compute_encoder.set_input_array(qv_data, 2);
+    compute_encoder.set_input_array(qv_scales, 3);
+    compute_encoder.set_input_array(qv_biases, 4);
+    compute_encoder.set_output_array(o, 5);
+    compute_encoder.set_bytes(attn_params, 6);
+    compute_encoder.set_bytes(qv_data_head_stride, 7);
+    compute_encoder.set_bytes(qv_group_head_stride, 8);
+    compute_encoder.set_bytes(group_size_, 9);
+
+    MTL::Size grid_dims(NQ, H_size, B_size);
+    MTL::Size group_dims(32, WM, WN);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  }
 
   metal::get_command_encoder(s).add_temporaries(std::move(copies));
+}
+
+void ScaledDotProductAttentionQVCB::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& o = outputs[0];
+
+  const auto& q = inputs[0];
+  const auto& k = inputs[1];
+  const auto& v_packed = inputs[2];
+  const auto& v_norms = inputs[3];
+  const auto& v_codebook = inputs[4];
+
+  int D = q.shape(-1);
+  int L = q.shape(2);
+  int N = k.shape(2);
+  int gqa_factor = q.shape(1) / k.shape(1);
+
+  o.set_data(allocator::malloc(o.nbytes()));
+
+  size_t v_data_head_stride =
+      v_packed.shape(1) == 1 ? v_packed.strides(0) : v_packed.strides(1);
+  size_t v_norms_head_stride =
+      v_norms.shape(1) == 1 ? v_norms.strides(0) : v_norms.strides(1);
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+
+  // Use steel prefill for L>8 with supported configs
+  bool steel_supported = (q.dtype() == float16) &&
+      (bits_ == 2 || bits_ == 3 || bits_ == 4) &&
+      (D == 64 || D == 128 || D == 256) && (L > 8);
+
+  if (steel_supported) {
+    using namespace mlx::steel;
+
+    int B_size = q.shape(0);
+    int H_size = q.shape(1);
+    int BQ = 32;
+    int BK = D <= 128 ? 32 : 16;
+    int WM = 4;
+    int WN = 1;
+
+    std::string kname;
+    kname.reserve(128);
+    kname += "attention_qv_cb_";
+    kname += get_type_string(q.dtype());
+    kname += "_bq" + std::to_string(BQ);
+    kname += "_bk" + std::to_string(BK);
+    kname += "_bd" + std::to_string(D);
+    kname += "_wm" + std::to_string(WM);
+    kname += "_wn" + std::to_string(WN);
+    kname += "_b" + std::to_string(bits_);
+
+    bool align_Q_val = (L % BQ) == 0;
+    bool align_K_val = (N % BK) == 0;
+    bool has_mask_val = false;
+    bool do_causal_val = false;
+    metal::MTLFCList func_consts = {
+        {&align_Q_val, MTL::DataType::DataTypeBool, 200},
+        {&align_K_val, MTL::DataType::DataTypeBool, 201},
+        {&has_mask_val, MTL::DataType::DataTypeBool, 300},
+        {&do_causal_val, MTL::DataType::DataTypeBool, 301},
+    };
+    std::string hash_name = kname;
+    hash_name += align_Q_val ? "_aQ" : "_nQ";
+    hash_name += align_K_val ? "_aK" : "_nK";
+
+    auto kernel = d.get_kernel(kname, hash_name, func_consts);
+    compute_encoder.set_compute_pipeline_state(kernel);
+
+    int NQ = (L + BQ - 1) / BQ;
+    int NK = (N + BK - 1) / BK;
+    int n_kv_heads = k.shape(1);
+
+    AttnParams attn_params{
+        /* B = */ B_size,
+        /* H = */ H_size,
+        /* D = */ D,
+        /* qL = */ L,
+        /* kL = */ N,
+        /* gqa_factor = */ gqa_factor,
+        /* scale = */ scale_,
+        /* NQ = */ NQ,
+        /* NK = */ NK,
+        /* NQ_aligned = */ L / BQ,
+        /* NK_aligned = */ N / BK,
+        /* qL_rem = */ L - (L / BQ) * BQ,
+        /* kL_rem = */ N - (N / BK) * BK,
+        /* qL_off = */ N - L,
+        /* Q_strides = */ {q.strides(0), q.strides(1), q.strides(2)},
+        /* K_strides = */ {k.strides(0), k.strides(1), k.strides(2)},
+        /* V_strides = */ {0, 0, 0},
+        /* O_strides = */ {o.strides(0), o.strides(1), o.strides(2)},
+    };
+
+    compute_encoder.set_input_array(q, 0);
+    compute_encoder.set_input_array(k, 1);
+    compute_encoder.set_input_array(v_packed, 2);
+    compute_encoder.set_input_array(v_norms, 3);
+    compute_encoder.set_input_array(v_codebook, 4);
+    compute_encoder.set_output_array(o, 5);
+    compute_encoder.set_bytes(attn_params, 6);
+    compute_encoder.set_bytes(v_data_head_stride, 7);
+    compute_encoder.set_bytes(v_norms_head_stride, 8);
+
+    MTL::Size grid_dims(NQ, H_size, B_size);
+    MTL::Size group_dims(32, WM, WN);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  } else {
+    // Fallback: use sdpa_vector-style dispatch for L<=8 or unsupported D
+    // Each threadgroup handles one query position
+    // Use the scalar decode kernel with dequantized V (for now)
+    throw std::runtime_error(
+        "[scaled_dot_product_attention_qv_cb] decode path NYI — "
+        "use turbo_decode + native SDPA for L<=8");
+  }
+}
+
+bool ScaledDotProductAttentionQVCB::is_equivalent(const Primitive& other) const {
+  const auto& o = static_cast<const ScaledDotProductAttentionQVCB&>(other);
+  return scale_ == o.scale_ && bits_ == o.bits_;
 }
 
 } // namespace mlx::core::fast

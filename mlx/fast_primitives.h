@@ -260,6 +260,35 @@ class ScaledDotProductAttention : public Custom {
   bool output_logsumexp_;
 };
 
+class ScaledDotProductAttentionQVCB : public Custom {
+ public:
+  ScaledDotProductAttentionQVCB(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      float scale,
+      int bits)
+      : Custom(stream, std::move(fallback)),
+        scale_(scale),
+        bits_(bits) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  bool is_equivalent(const Primitive& other) const override;
+
+  DEFINE_NAME(ScaledDotProductAttentionQVCB);
+  DEFINE_INPUT_OUTPUT_SHAPE()
+
+ private:
+  float scale_;
+  int bits_;
+};
+
 class ScaledDotProductAttentionQV : public Custom {
  public:
   ScaledDotProductAttentionQV(
