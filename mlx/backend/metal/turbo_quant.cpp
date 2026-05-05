@@ -15,12 +15,24 @@ inline int packed_width(int dim, int bits) {
   return (dim * bits + 31) / 32;
 }
 
-// Ensure array is row-contiguous; copy if not.
-inline array ensure_contiguous(const array& x, const Stream& s) {
+// Ensure array is row-contiguous; copy if not. The copy (if any) is appended
+// to `copies` so the caller can pass them to `add_temporaries` and keep the
+// underlying MTL buffers alive until the command buffer completes. Without
+// that registration the temporary `array::Data` shared_ptr drops at the end
+// of `eval_gpu` and `BufferCache::reuse_from_cache` can hand the buffer to
+// another allocation while the CB is still pending → "Invalid Resource"
+// (or, depending on which thread observes it first, the Swift-level
+// `MLXArray deallocated with non-zero retain count` warning).
+//
+// Mirrors the SDPA pattern in `scaled_dot_product_attention.cpp` (search for
+// `add_temporaries(std::move(copies))`).
+inline const array&
+ensure_contiguous(const array& x, const Stream& s, std::vector<array>& copies) {
   if (x.flags().row_contiguous) {
     return x;
   }
-  return contiguous_copy_gpu(x, s);
+  copies.push_back(contiguous_copy_gpu(x, s));
+  return copies.back();
 }
 
 } // namespace
@@ -36,10 +48,12 @@ void TurboScore::eval_gpu(
   auto& d = metal::device(s.device);
   auto& out = outputs[0];
 
-  auto q_rot = ensure_contiguous(inputs[0], s);
-  auto packed = ensure_contiguous(inputs[1], s);
-  auto norms = ensure_contiguous(inputs[2], s);
-  auto codebook = ensure_contiguous(inputs[3], s);
+  std::vector<array> copies;
+  copies.reserve(inputs.size());
+  const auto& q_rot = ensure_contiguous(inputs[0], s, copies);
+  const auto& packed = ensure_contiguous(inputs[1], s, copies);
+  const auto& norms = ensure_contiguous(inputs[2], s, copies);
+  const auto& codebook = ensure_contiguous(inputs[3], s, copies);
 
   out.set_data(allocator::malloc(out.nbytes()));
 
@@ -64,6 +78,7 @@ void TurboScore::eval_gpu(
   auto grid = MTL::Size(32, total_q, token_count);
   auto group = MTL::Size(32, 1, 1);
   compute_encoder.dispatch_threads(grid, group);
+  compute_encoder.add_temporaries(std::move(copies));
 }
 
 bool TurboScore::is_equivalent(const Primitive& other) const {
@@ -84,7 +99,9 @@ void TurboEncode::eval_gpu(
   auto& packed_out = outputs[0];
   auto& norms_out = outputs[1];
 
-  auto input = ensure_contiguous(inputs[0], s);
+  std::vector<array> copies;
+  copies.reserve(inputs.size());
+  const auto& input = ensure_contiguous(inputs[0], s, copies);
   int num_rows = input.shape(0);
 
   // Allocate outputs — fresh buffers always.
@@ -96,8 +113,8 @@ void TurboEncode::eval_gpu(
   std::string kname;
   if (use_wht_) {
     // WHT variant: inputs are [input, wht_signs, boundaries]
-    auto wht_signs = ensure_contiguous(inputs[1], s);
-    auto boundaries = ensure_contiguous(inputs[2], s);
+    const auto& wht_signs = ensure_contiguous(inputs[1], s, copies);
+    const auto& boundaries = ensure_contiguous(inputs[2], s, copies);
 
     kname = "turbo_fused_encode_wht_" + std::to_string(bits_) + "_" +
         std::to_string(dim_);
@@ -116,11 +133,13 @@ void TurboEncode::eval_gpu(
     auto grid = MTL::Size(num_rows, 1, 1);
     auto group = MTL::Size(dim_, 1, 1);
     compute_encoder.dispatch_threadgroups(grid, group);
+    compute_encoder.add_temporaries(std::move(copies));
   } else {
-    // Dense rotation variant: inputs are [input, rotation, boundaries, codebook]
-    auto rotation = ensure_contiguous(inputs[1], s);
-    auto boundaries = ensure_contiguous(inputs[2], s);
-    auto codebook = ensure_contiguous(inputs[3], s);
+    // Dense rotation variant: inputs are [input, rotation, boundaries,
+    // codebook]
+    const auto& rotation = ensure_contiguous(inputs[1], s, copies);
+    const auto& boundaries = ensure_contiguous(inputs[2], s, copies);
+    const auto& codebook = ensure_contiguous(inputs[3], s, copies);
 
     kname = "turbo_fused_encode_" + std::to_string(bits_) + "_" +
         std::to_string(dim_);
@@ -138,6 +157,7 @@ void TurboEncode::eval_gpu(
     auto grid = MTL::Size(num_rows, 1, 1);
     auto group = MTL::Size(dim_, 1, 1);
     compute_encoder.dispatch_threadgroups(grid, group);
+    compute_encoder.add_temporaries(std::move(copies));
   }
 }
 
@@ -167,13 +187,15 @@ void TurboFlashPass1::eval_gpu(
   auto& m_partials = outputs[1];
   auto& l_partials = outputs[2];
 
-  auto q_rot = ensure_contiguous(inputs[0], s);
-  auto key_packed = ensure_contiguous(inputs[1], s);
-  auto key_norms = ensure_contiguous(inputs[2], s);
-  auto key_codebook = ensure_contiguous(inputs[3], s);
-  auto val_packed = ensure_contiguous(inputs[4], s);
-  auto val_norms = ensure_contiguous(inputs[5], s);
-  auto val_codebook = ensure_contiguous(inputs[6], s);
+  std::vector<array> copies;
+  copies.reserve(inputs.size());
+  const auto& q_rot = ensure_contiguous(inputs[0], s, copies);
+  const auto& key_packed = ensure_contiguous(inputs[1], s, copies);
+  const auto& key_norms = ensure_contiguous(inputs[2], s, copies);
+  const auto& key_codebook = ensure_contiguous(inputs[3], s, copies);
+  const auto& val_packed = ensure_contiguous(inputs[4], s, copies);
+  const auto& val_norms = ensure_contiguous(inputs[5], s, copies);
+  const auto& val_codebook = ensure_contiguous(inputs[6], s, copies);
 
   int total_q = q_rot.shape(0);
 
@@ -225,6 +247,7 @@ void TurboFlashPass1::eval_gpu(
   auto grid = MTL::Size(32, total_q, num_blocks);
   auto group = MTL::Size(32, 1, 1);
   compute_encoder.dispatch_threads(grid, group);
+  compute_encoder.add_temporaries(std::move(copies));
 }
 
 bool TurboFlashPass1::is_equivalent(const Primitive& other) const {
@@ -257,13 +280,15 @@ void TurboFlashPass1NR0::eval_gpu(
   auto& m_partials = outputs[1];
   auto& l_partials = outputs[2];
 
-  auto q_rot = ensure_contiguous(inputs[0], s);
-  auto key_packed = ensure_contiguous(inputs[1], s);
-  auto key_norms = ensure_contiguous(inputs[2], s);
-  auto key_codebook = ensure_contiguous(inputs[3], s);
-  auto val_packed = ensure_contiguous(inputs[4], s);
-  auto val_norms = ensure_contiguous(inputs[5], s);
-  auto val_codebook = ensure_contiguous(inputs[6], s);
+  std::vector<array> copies;
+  copies.reserve(inputs.size());
+  const auto& q_rot = ensure_contiguous(inputs[0], s, copies);
+  const auto& key_packed = ensure_contiguous(inputs[1], s, copies);
+  const auto& key_norms = ensure_contiguous(inputs[2], s, copies);
+  const auto& key_codebook = ensure_contiguous(inputs[3], s, copies);
+  const auto& val_packed = ensure_contiguous(inputs[4], s, copies);
+  const auto& val_norms = ensure_contiguous(inputs[5], s, copies);
+  const auto& val_codebook = ensure_contiguous(inputs[6], s, copies);
 
   int total_q = q_rot.shape(0);
 
@@ -318,6 +343,7 @@ void TurboFlashPass1NR0::eval_gpu(
   auto grid = MTL::Size(32, total_q / nr0_, num_blocks);
   auto group = MTL::Size(32, 1, 1);
   compute_encoder.dispatch_threads(grid, group);
+  compute_encoder.add_temporaries(std::move(copies));
 }
 
 bool TurboFlashPass1NR0::is_equivalent(const Primitive& other) const {
@@ -347,9 +373,11 @@ void TurboFlashPass2::eval_gpu(
   auto& d = metal::device(s.device);
   auto& out = outputs[0];
 
-  auto o_partials = ensure_contiguous(inputs[0], s);
-  auto m_partials = ensure_contiguous(inputs[1], s);
-  auto l_partials = ensure_contiguous(inputs[2], s);
+  std::vector<array> copies;
+  copies.reserve(inputs.size());
+  const auto& o_partials = ensure_contiguous(inputs[0], s, copies);
+  const auto& m_partials = ensure_contiguous(inputs[1], s, copies);
+  const auto& l_partials = ensure_contiguous(inputs[2], s, copies);
 
   int total_q = m_partials.shape(0);
   int num_blocks = m_partials.shape(1);
@@ -358,7 +386,7 @@ void TurboFlashPass2::eval_gpu(
 
   std::string kname;
   if (fused_rotation_) {
-    auto val_rotation = ensure_contiguous(inputs[3], s);
+    const auto& val_rotation = ensure_contiguous(inputs[3], s, copies);
 
     kname = "turbo_flash_p2_fused_" + std::to_string(dim_);
     auto kernel = d.get_kernel(kname);
@@ -375,6 +403,7 @@ void TurboFlashPass2::eval_gpu(
     auto grid = MTL::Size(32, total_q, 1);
     auto group = MTL::Size(32, 1, 1);
     compute_encoder.dispatch_threads(grid, group);
+    compute_encoder.add_temporaries(std::move(copies));
   } else {
     kname = "turbo_flash_p2_" + std::to_string(dim_);
     auto kernel = d.get_kernel(kname);
@@ -390,6 +419,7 @@ void TurboFlashPass2::eval_gpu(
     auto grid = MTL::Size(32, total_q, 1);
     auto group = MTL::Size(32, 1, 1);
     compute_encoder.dispatch_threads(grid, group);
+    compute_encoder.add_temporaries(std::move(copies));
   }
 }
 
@@ -409,10 +439,12 @@ void TurboValue::eval_gpu(
   auto& d = metal::device(s.device);
   auto& out = outputs[0];
 
-  auto weights = ensure_contiguous(inputs[0], s);
-  auto packed = ensure_contiguous(inputs[1], s);
-  auto norms = ensure_contiguous(inputs[2], s);
-  auto codebook = ensure_contiguous(inputs[3], s);
+  std::vector<array> copies;
+  copies.reserve(inputs.size());
+  const auto& weights = ensure_contiguous(inputs[0], s, copies);
+  const auto& packed = ensure_contiguous(inputs[1], s, copies);
+  const auto& norms = ensure_contiguous(inputs[2], s, copies);
+  const auto& codebook = ensure_contiguous(inputs[3], s, copies);
 
   int total_heads = weights.shape(0);
   int token_count = weights.shape(1);
@@ -442,6 +474,7 @@ void TurboValue::eval_gpu(
   auto grid = MTL::Size(32, total_heads, dim_blocks);
   auto group = MTL::Size(32, 1, 1);
   compute_encoder.dispatch_threads(grid, group);
+  compute_encoder.add_temporaries(std::move(copies));
 }
 
 bool TurboValue::is_equivalent(const Primitive& other) const {
