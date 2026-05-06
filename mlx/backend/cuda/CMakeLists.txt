@@ -31,6 +31,7 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/gemms/block_mask.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/gemms/gemv.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/gemms/cublas_gemm.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/gemms/gather_gemm.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/gemms/grouped_gemm_unaligned.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/hadamard.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/jit_module.cpp
@@ -119,11 +120,11 @@ target_compile_options(mlx
 target_compile_options(
   mlx PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>")
 
-if(MSVC)
-  # Ignore warnings from CUTLASS.
-  target_compile_options(
-    mlx PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe="--diag_suppress=2908">)
-else()
+# Ignore warnings from CUTLASS.
+target_compile_options(
+  mlx PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe="--diag_suppress=2908,2361">)
+
+if(NOT MSVC)
   # Required for generating optimized CUTLASS code.
   target_compile_options(
     mlx PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fno-strict-aliasing>")
@@ -167,9 +168,8 @@ set_target_properties(mlx PROPERTIES CUDA_ARCHITECTURES
                                      "${MLX_CUDA_ARCHITECTURES}")
 
 # Skip Hopper-only kernels when not building for sm90a.
-if(NOT DEFINED ENV{MLX_DISABLE_SM90A_KERNELS}
-   AND (("90a" IN_LIST MLX_CUDA_ARCHITECTURES) OR ("90a-real" IN_LIST
-                                                   MLX_CUDA_ARCHITECTURES)))
+if(("90a" IN_LIST MLX_CUDA_ARCHITECTURES) OR ("90a-real" IN_LIST
+                                              MLX_CUDA_ARCHITECTURES))
   target_compile_definitions(mlx PRIVATE MLX_CUDA_SM90A_ENABLED)
 endif()
 
@@ -279,7 +279,7 @@ target_link_libraries(mlx PRIVATE CUDNN::cudnn_all)
 FetchContent_Declare(
   cutlass
   GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
-  GIT_TAG v4.3.5
+  GIT_TAG v4.4.2
   GIT_SHALLOW TRUE
   SOURCE_SUBDIR include EXCLUDE_FROM_ALL)
 FetchContent_MakeAvailable(cutlass)

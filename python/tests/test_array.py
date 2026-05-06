@@ -767,10 +767,13 @@ class TestArray(mlx_tests.MLXTestCase):
 
     def test_array_np_shape_dim_check(self):
         a_npy = np.empty(2**31, dtype=np.bool_)
-        with self.assertRaises(ValueError) as e:
+        with self.assertRaises(OverflowError) as e:
             mx.array(a_npy)
         self.assertEqual(
-            str(e.exception), "Shape dimension falls outside supported `int` range."
+            str(e.exception),
+            "Shape dimension 2147483648 is outside the supported range "
+            "[-2147483648, 2147483647]. MLX currently uses 32-bit integers "
+            "for shape dimensions.",
         )
 
     def test_dtype_promotion(self):
