@@ -385,6 +385,44 @@ MLX_API std::vector<array> gated_delta_step_fused(
     int Hv,
     StreamOrDevice s = {});
 
+/// GatedDelta forward recurrence step with per-step `delta_t` tape capture.
+/// Used by speculative-decoder verify forwards on hybrid GDN+Attention
+/// models — captures innovations for possible rollback via `state_replay`.
+/// Returns {y [B, T, Hv, Dv], state_out [B, Hv, Dv, Dk], delta_log [B, T, Hv, Dv]}.
+MLX_API std::vector<array> gated_delta_step_record(
+    const array& q,
+    const array& k,
+    const array& v,
+    const array& g,
+    const array& beta,
+    const array& state,
+    const std::optional<array>& mask,
+    int T,
+    int Dk,
+    int Dv,
+    int Hk,
+    int Hv,
+    StreamOrDevice s = {});
+
+/// Tape-replay rollback. Re-folds the accepted prefix `[0, accepted)` of an
+/// innovation tape (per-step `(delta_t, k_t, g_t)` triples) onto a
+/// pre-record state snapshot. k_log carries GQA-expanded keys so the
+/// stride is `Hv * Dk` (not `Hk * Dk`).
+/// Returns {state_out [B, Hv, Dv, Dk]}.
+MLX_API std::vector<array> state_replay(
+    const array& delta_log,
+    const array& k_log,
+    const array& g_log,
+    const array& state,
+    const std::optional<array>& mask,
+    int T_log,
+    int accepted,
+    int Dk,
+    int Dv,
+    int Hk,
+    int Hv,
+    StreamOrDevice s = {});
+
 /// SSM (Selective State Space Model) recurrence step.
 /// Returns {out [N, Dh], state_out [N, Dh, Ds]}.
 MLX_API std::vector<array> ssm_step(

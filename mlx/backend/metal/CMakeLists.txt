@@ -117,6 +117,7 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/fence.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/fft.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/gated_delta.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/gated_delta_replay.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/hadamard.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/indexing.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/logsumexp.cpp

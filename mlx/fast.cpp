@@ -1898,6 +1898,106 @@ std::vector<array> gated_delta_step_fused(
   return outputs;
 }
 
+std::vector<array> gated_delta_step_record(
+    const array& q,
+    const array& k,
+    const array& v,
+    const array& g,
+    const array& beta,
+    const array& state,
+    const std::optional<array>& mask,
+    int T,
+    int Dk,
+    int Dv,
+    int Hk,
+    int Hv,
+    StreamOrDevice s_ /* = {} */) {
+  auto s = to_stream(s_);
+  auto out_type = q.dtype();
+  bool has_mask = mask.has_value();
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[gated_delta_step_record] Only runs on GPU");
+  };
+
+  // Output shapes
+  // y: [B, T, Hv, Dv]
+  int B = static_cast<int>(state.shape(0));
+  Shape y_shape = {B, T, Hv, Dv};
+  // state_out: [B, Hv, Dv, Dk]
+  Shape state_shape = state.shape();
+  // delta_log: [B, T, Hv, Dv]
+  Shape tape_shape = {B, T, Hv, Dv};
+
+  // Input buffer order:
+  //   0=q, 1=k, 2=v, 3=g, 4=beta, 5=state_in, [6=mask]
+  std::vector<array> inputs = {
+      astype(q, out_type, s),
+      astype(k, out_type, s),
+      astype(v, out_type, s),
+      astype(g, out_type, s),
+      astype(beta, out_type, s),
+      astype(state, out_type, s)};
+  if (has_mask) {
+    inputs.push_back(*mask);
+  }
+
+  auto outputs = array::make_arrays(
+      {std::move(y_shape), std::move(state_shape), std::move(tape_shape)},
+      {out_type, out_type, out_type},
+      std::make_shared<GatedDeltaStepRecord>(
+          s, fallback, has_mask, T, Dk, Dv, Hk, Hv),
+      std::move(inputs));
+  // Break sibling bond (see gated_delta_step comment above).
+  async_eval(outputs);
+  return outputs;
+}
+
+std::vector<array> state_replay(
+    const array& delta_log,
+    const array& k_log,
+    const array& g_log,
+    const array& state,
+    const std::optional<array>& mask,
+    int T_log,
+    int accepted,
+    int Dk,
+    int Dv,
+    int Hk,
+    int Hv,
+    StreamOrDevice s_ /* = {} */) {
+  auto s = to_stream(s_);
+  auto out_type = state.dtype();
+  bool has_mask = mask.has_value();
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[state_replay] Only runs on GPU");
+  };
+
+  // Output shape: state_out [B, Hv, Dv, Dk]
+  Shape state_shape = state.shape();
+
+  // Input buffer order:
+  //   0=delta_log, 1=k_log, 2=g_log, 3=state_in, [4=mask]
+  // Cast tape entries to state dtype for kernel uniformity.
+  std::vector<array> inputs = {
+      astype(delta_log, out_type, s),
+      astype(k_log, out_type, s),
+      astype(g_log, out_type, s),
+      astype(state, out_type, s)};
+  if (has_mask) {
+    inputs.push_back(*mask);
+  }
+
+  auto outputs = array::make_arrays(
+      {std::move(state_shape)},
+      {out_type},
+      std::make_shared<TapeReplay>(
+          s, fallback, has_mask, T_log, accepted, Dk, Dv, Hk, Hv),
+      std::move(inputs));
+  return outputs;
+}
+
 std::vector<array> ssm_step(
     const array& X,
     const array& A_log,

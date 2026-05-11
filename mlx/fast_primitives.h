@@ -956,6 +956,110 @@ class GatedDeltaStep : public Custom {
   int Hv_;
 };
 
+/// GatedDelta forward kernel with per-step `delta_t` tape capture.
+/// Used by speculative-decoder verify forwards on hybrid GDN+Attention
+/// models (Qwen 3.5 / 3.6) — captures innovations for possible
+/// rollback via the paired `TapeReplay` primitive. Outputs:
+///   {y [B, T, Hv, Dv], state_out [B, Hv, Dv, Dk], delta_log [B, T, Hv, Dv]}
+class GatedDeltaStepRecord : public Custom {
+ public:
+  GatedDeltaStepRecord(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      bool has_mask,
+      int T,
+      int Dk,
+      int Dv,
+      int Hk,
+      int Hv)
+      : Custom(stream, std::move(fallback)),
+        has_mask_(has_mask),
+        T_(T),
+        Dk_(Dk),
+        Dv_(Dv),
+        Hk_(Hk),
+        Hv_(Hv) {}
+
+  static bool use_fallback(Stream stream);
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(GatedDeltaStepRecord)
+  bool is_equivalent(const Primitive& other) const override;
+  DEFINE_INPUT_OUTPUT_SHAPE()
+
+  auto state() const {
+    return std::make_tuple(nullptr, has_mask_, T_, Dk_, Dv_, Hk_, Hv_);
+  }
+
+ private:
+  bool has_mask_;
+  int T_;
+  int Dk_;
+  int Dv_;
+  int Hk_;
+  int Hv_;
+};
+
+/// Tape-replay rollback kernel. Re-folds the accepted prefix
+/// `[0, accepted)` of an innovation tape (per-step `(delta_t, k_t, g_t)`
+/// triples) onto a pre-record state snapshot. Adopts upstream dflash-mlx
+/// correctness patterns from day 1 (masked-timestep fix + branchless
+/// `metal::select`). Output: {state_out [B, Hv, Dv, Dk]}.
+class TapeReplay : public Custom {
+ public:
+  TapeReplay(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      bool has_mask,
+      int T_log,
+      int accepted,
+      int Dk,
+      int Dv,
+      int Hk,
+      int Hv)
+      : Custom(stream, std::move(fallback)),
+        has_mask_(has_mask),
+        T_log_(T_log),
+        accepted_(accepted),
+        Dk_(Dk),
+        Dv_(Dv),
+        Hk_(Hk),
+        Hv_(Hv) {}
+
+  static bool use_fallback(Stream stream);
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("NYI");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(TapeReplay)
+  bool is_equivalent(const Primitive& other) const override;
+  DEFINE_INPUT_OUTPUT_SHAPE()
+
+  auto state() const {
+    return std::make_tuple(
+        nullptr, has_mask_, T_log_, accepted_, Dk_, Dv_, Hk_, Hv_);
+  }
+
+ private:
+  bool has_mask_;
+  int T_log_;
+  int accepted_;
+  int Dk_;
+  int Dv_;
+  int Hk_;
+  int Hv_;
+};
+
 class SSMStep : public Custom {
  public:
   SSMStep(
