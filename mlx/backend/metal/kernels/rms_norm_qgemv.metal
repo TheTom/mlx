@@ -30,7 +30,7 @@ inline float qdot_4bit(
   float accum = 0;
   for (int i = 0; i < (values_per_thread / 4); i++) {
     accum +=
-        (x_thread[4 * i]     * float(ws[i] & 0x000f) +
+        (x_thread[4 * i] * float(ws[i] & 0x000f) +
          x_thread[4 * i + 1] * float(ws[i] & 0x00f0) +
          x_thread[4 * i + 2] * float(ws[i] & 0x0f00) +
          x_thread[4 * i + 3] * float(ws[i] & 0xf000));
@@ -51,10 +51,14 @@ inline float qdot_4bit_safe(
   float accum = 0;
   for (int i = 0; i < (values_per_thread / 4); i++) {
     int base = 4 * i;
-    if (base < remaining) accum += x_thread[base] * float(ws[i] & 0x000f);
-    if (base + 1 < remaining) accum += x_thread[base + 1] * float(ws[i] & 0x00f0);
-    if (base + 2 < remaining) accum += x_thread[base + 2] * float(ws[i] & 0x0f00);
-    if (base + 3 < remaining) accum += x_thread[base + 3] * float(ws[i] & 0xf000);
+    if (base < remaining)
+      accum += x_thread[base] * float(ws[i] & 0x000f);
+    if (base + 1 < remaining)
+      accum += x_thread[base + 1] * float(ws[i] & 0x00f0);
+    if (base + 2 < remaining)
+      accum += x_thread[base + 2] * float(ws[i] & 0x0f00);
+    if (base + 3 < remaining)
+      accum += x_thread[base + 3] * float(ws[i] & 0xf000);
   }
   return scale * accum + sum * bias;
 }
@@ -76,15 +80,14 @@ template <typename T, int group_size>
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-
   constexpr int bits = 4;
   constexpr int SIMD_SIZE = 32;
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
-  constexpr int pack_factor = 8;  // 8 4-bit values per uint32
-  constexpr int values_per_thread = pack_factor;  // 8
-  constexpr int block_size = values_per_thread * SIMD_SIZE;  // 256
-  constexpr int bytes_per_pack = 4;  // uint32 = 4 bytes
+  constexpr int pack_factor = 8; // 8 4-bit values per uint32
+  constexpr int values_per_thread = pack_factor; // 8
+  constexpr int block_size = values_per_thread * SIMD_SIZE; // 256
+  constexpr int bytes_per_pack = 4; // uint32 = 4 bytes
   constexpr int scale_step_per_thread = group_size / values_per_thread;
 
   // ======================================================================
@@ -111,7 +114,8 @@ template <typename T, int group_size>
   sum_sq = simd_sum(sum_sq);
 
   threadgroup float simd_sums[2];
-  if (simd_lid == 0) simd_sums[simd_gid] = sum_sq;
+  if (simd_lid == 0)
+    simd_sums[simd_gid] = sum_sq;
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   if (simd_gid == 0 && simd_lid == 0) {
@@ -134,7 +138,8 @@ template <typename T, int group_size>
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
-  if (out_row >= out_vec_size) return;
+  if (out_row >= out_vec_size)
+    return;
 
   const int used_out_row = min(out_vec_size - results_per_simdgroup, out_row);
 
@@ -151,9 +156,14 @@ template <typename T, int group_size>
   // Masks 0x000f, 0x00f0, 0x0f00, 0xf000 produce values ×1, ×16, ×256, ×4096.
   // x_thread[i] is pre-divided to compensate, repeating per uint16 pack.
   constexpr float qdot_prescale[8] = {
-      1.0f, 1.0f/16.0f, 1.0f/256.0f, 1.0f/4096.0f,
-      1.0f, 1.0f/16.0f, 1.0f/256.0f, 1.0f/4096.0f
-  };
+      1.0f,
+      1.0f / 16.0f,
+      1.0f / 256.0f,
+      1.0f / 4096.0f,
+      1.0f,
+      1.0f / 16.0f,
+      1.0f / 256.0f,
+      1.0f / 4096.0f};
 
   for (; k < in_vec_size - block_size; k += block_size) {
     // Load normed x from shared memory with qdot pre-scaling
@@ -182,7 +192,8 @@ template <typename T, int group_size>
   // Handle remaining elements
   const int remaining = clamp(
       int(in_vec_size) - k - int(simd_lid * values_per_thread),
-      0, values_per_thread);
+      0,
+      values_per_thread);
   if (remaining > 0) {
     float sum = 0;
     for (int i = 0; i < values_per_thread; i++) {
@@ -201,8 +212,8 @@ template <typename T, int group_size>
       auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
       float s = float(scales[row * in_vec_size_g]);
       float b = float(biases[row * in_vec_size_g]);
-      result[row] += qdot_4bit_safe<values_per_thread>(
-          wl, x_thread, s, b, sum, remaining);
+      result[row] +=
+          qdot_4bit_safe<values_per_thread>(wl, x_thread, s, b, sum, remaining);
     }
   }
 
@@ -217,15 +228,23 @@ template <typename T, int group_size>
 // ============================================================================
 // Instantiation
 // ============================================================================
-#define instantiate_rms_norm_qgemv(type, tname, gs) \
-  template [[host_name("rms_norm_qgemv_" #tname "_gs" #gs)]] \
-  [[kernel]] void rms_norm_qgemv<type, gs>( \
-    const device type*, const device type*, const device uint32_t*, \
-    const device type*, const device type*, device type*, \
-    constant float&, constant int&, constant int&, \
-    uint3, uint, uint);
+#define instantiate_rms_norm_qgemv(type, tname, gs)                          \
+  template [[host_name("rms_norm_qgemv_" #tname "_gs" #gs)]] [[kernel]] void \
+  rms_norm_qgemv<type, gs>(                                                  \
+      const device type*,                                                    \
+      const device type*,                                                    \
+      const device uint32_t*,                                                \
+      const device type*,                                                    \
+      const device type*,                                                    \
+      device type*,                                                          \
+      constant float&,                                                       \
+      constant int&,                                                         \
+      constant int&,                                                         \
+      uint3,                                                                 \
+      uint,                                                                  \
+      uint);
 
 instantiate_rms_norm_qgemv(half, float16, 64)
-instantiate_rms_norm_qgemv(bfloat16_t, bfloat16, 64)
-instantiate_rms_norm_qgemv(half, float16, 128)
-instantiate_rms_norm_qgemv(bfloat16_t, bfloat16, 128)
+    instantiate_rms_norm_qgemv(bfloat16_t, bfloat16, 64)
+        instantiate_rms_norm_qgemv(half, float16, 128)
+            instantiate_rms_norm_qgemv(bfloat16_t, bfloat16, 128)

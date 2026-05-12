@@ -89,8 +89,8 @@ template <typename T, int activation_type, int N_READS = FUSED_GATE_N_READS>
     for (int k = 0; k < N_READS; ++k) {
       uint ik = i + k;
       if (ik < hidden_dims) {
-        o_row[ik] = static_cast<T>(apply_gate<activation_type>(
-            float(gu_row[ik]), float(up_base[ik])));
+        o_row[ik] = static_cast<T>(
+            apply_gate<activation_type>(float(gu_row[ik]), float(up_base[ik])));
       }
     }
   }
@@ -137,27 +137,24 @@ template <typename T, int activation_type, int N_READS = FUSED_GATE_N_READS>
 
 // ─── Instantiations ─────────────────────────────────────────────────────────
 
-#define instantiate_fga_single(name, type, act)                           \
-  template                                                                \
-      [[host_name("fused_gate_activation_single_row_" #name "_act" #act)]] \
-      [[kernel]] void fused_gate_activation_single_row<type, act>(         \
-          const device type*, device type*, constant uint&, uint, uint);
+#define instantiate_fga_single(name, type, act)                                \
+  template [[host_name(                                                        \
+      "fused_gate_activation_single_row_" #name "_act" #act)]] [[kernel]] void \
+  fused_gate_activation_single_row<type, act>(                                 \
+      const device type*, device type*, constant uint&, uint, uint);
 
-#define instantiate_fga_looped(name, type, act)                           \
-  template                                                                \
-      [[host_name("fused_gate_activation_looped_" #name "_act" #act)]]    \
-      [[kernel]] void fused_gate_activation_looped<type, act>(            \
-          const device type*, device type*, constant uint&, uint, uint,   \
-          uint);
+#define instantiate_fga_looped(name, type, act)                            \
+  template [[host_name(                                                    \
+      "fused_gate_activation_looped_" #name "_act" #act)]] [[kernel]] void \
+  fused_gate_activation_looped<type, act>(                                 \
+      const device type*, device type*, constant uint&, uint, uint, uint);
 
-#define instantiate_fga(name, type)       \
-  instantiate_fga_single(name, type, 0)   \
-  instantiate_fga_single(name, type, 1)   \
-  instantiate_fga_single(name, type, 2)   \
-  instantiate_fga_looped(name, type, 0)   \
-  instantiate_fga_looped(name, type, 1)   \
-  instantiate_fga_looped(name, type, 2)
+#define instantiate_fga(name, type)                                           \
+  instantiate_fga_single(name, type, 0) instantiate_fga_single(name, type, 1) \
+      instantiate_fga_single(name, type, 2)                                   \
+          instantiate_fga_looped(name, type, 0)                               \
+              instantiate_fga_looped(name, type, 1)                           \
+                  instantiate_fga_looped(name, type, 2)
 
-instantiate_fga(float32, float)
-instantiate_fga(float16, half)
-instantiate_fga(bfloat16, bfloat16_t)
+instantiate_fga(float32, float) instantiate_fga(float16, half)
+    instantiate_fga(bfloat16, bfloat16_t)

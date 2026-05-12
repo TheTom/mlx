@@ -1,8 +1,9 @@
 // Copyright © 2024-2026 Apple Inc.
 
 // Fused RMSNorm + RoPE kernel
-// Combines RMS normalization with rotary position embedding in a single dispatch.
-// Saves one Metal kernel launch per Q/K vs separate rms_norm + rope calls.
+// Combines RMS normalization with rotary position embedding in a single
+// dispatch. Saves one Metal kernel launch per Q/K vs separate rms_norm + rope
+// calls.
 
 #include <metal_common>
 #include <metal_simdgroup>
@@ -13,11 +14,14 @@ using namespace metal;
 
 /// Fused RMSNorm + RoPE for non-traditional (paired) layout.
 ///
-/// Input/output: one row per (batch, seq_pos, head), each of length `axis_size`.
-/// Each threadgroup processes one row. Thread count = axis_size / 2 (one per rotation pair).
+/// Input/output: one row per (batch, seq_pos, head), each of length
+/// `axis_size`. Each threadgroup processes one row. Thread count = axis_size /
+/// 2 (one per rotation pair).
 ///
-/// Phase 1: Compute inv_rms = rsqrt(mean(x^2) + eps) via SIMD + threadgroup reduction.
-///          Each thread loads x[tid] and x[tid + half], accumulating two squared values.
+/// Phase 1: Compute inv_rms = rsqrt(mean(x^2) + eps) via SIMD + threadgroup
+/// reduction.
+///          Each thread loads x[tid] and x[tid + half], accumulating two
+///          squared values.
 /// Phase 2: Apply weight scaling and RoPE rotation:
 ///          normed_a = w[tid] * x[tid] * inv_rms
 ///          normed_b = w[tid+half] * x[tid+half] * inv_rms
@@ -74,12 +78,14 @@ template <typename T>
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  if (lid >= half_dim) return;
+  if (lid >= half_dim)
+    return;
 
   float inv_rms = local_inv_rms[0];
 
   // Phase 2: Apply weight * inv_rms * RoPE rotation
-  // Row layout is [B, L, nHeads, headDim], position = offset + (gid / nHeads) % seqLen
+  // Row layout is [B, L, nHeads, headDim], position = offset + (gid / nHeads) %
+  // seqLen
   uint l = (gid / uint(n_heads)) % uint(seq_len);
   float pos = float(offset + int(l));
 
@@ -95,14 +101,23 @@ template <typename T>
   o_row[lid + half_dim] = static_cast<T>(normed_a * sin_t + normed_b * cos_t);
 }
 
-#define instantiate_rms_norm_rope(name, type) \
-  template [[host_name("rms_norm_rope_" #name)]] \
-  [[kernel]] void rms_norm_rope<type>( \
-      const device type*, const device type*, const device float*, \
-      device type*, constant float&, constant uint&, \
-      constant int&, constant int&, constant int&, \
-      uint, uint, uint, uint);
+#define instantiate_rms_norm_rope(name, type)                    \
+  template [[host_name("rms_norm_rope_" #name)]] [[kernel]] void \
+  rms_norm_rope<type>(                                           \
+      const device type*,                                        \
+      const device type*,                                        \
+      const device float*,                                       \
+      device type*,                                              \
+      constant float&,                                           \
+      constant uint&,                                            \
+      constant int&,                                             \
+      constant int&,                                             \
+      constant int&,                                             \
+      uint,                                                      \
+      uint,                                                      \
+      uint,                                                      \
+      uint);
 
 instantiate_rms_norm_rope(float32, float)
-instantiate_rms_norm_rope(float16, half)
-instantiate_rms_norm_rope(bfloat16, bfloat16_t)
+    instantiate_rms_norm_rope(float16, half)
+        instantiate_rms_norm_rope(bfloat16, bfloat16_t)

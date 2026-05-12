@@ -11,8 +11,8 @@
 // Each simdgroup cooperatively reduces over the Ds state dimension.
 
 #include <metal_common>
-#include <metal_simdgroup>
 #include <metal_math>
+#include <metal_simdgroup>
 
 #include "utils.h"
 
@@ -32,7 +32,6 @@ template <typename T, int Dh, int Ds, int H, int G>
     uint3 thread_position_in_grid [[thread_position_in_grid]],
     uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
     uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {
-
   constexpr int n_per_t = Ds / 32;
 
   auto n = thread_position_in_grid.z;
@@ -76,117 +75,369 @@ template <typename T, int Dh, int Ds, int H, int G>
 // ============================================================================
 // Instantiations for Nemotron and common SSM dimensions
 // ============================================================================
-#define instantiate_ssm(type, tname, dh, ds, h, g) \
-  template [[host_name("ssm_step_" #tname "_" #dh "_" #ds "_" #h "_" #g)]] \
-  [[kernel]] void ssm_step<type, dh, ds, h, g>( \
-    const device type*, const device type*, const device type*, \
-    const device type*, const device type*, const device type*, \
-    const device type*, device type*, device type*, \
-    uint3, uint3, uint);
+#define instantiate_ssm(type, tname, dh, ds, h, g)                        \
+  template [[host_name(                                                   \
+      "ssm_step_" #tname "_" #dh "_" #ds "_" #h "_" #g)]] [[kernel]] void \
+  ssm_step<type, dh, ds, h, g>(                                           \
+      const device type*,                                                 \
+      const device type*,                                                 \
+      const device type*,                                                 \
+      const device type*,                                                 \
+      const device type*,                                                 \
+      const device type*,                                                 \
+      const device type*,                                                 \
+      device type*,                                                       \
+      device type*,                                                       \
+      uint3,                                                              \
+      uint3,                                                              \
+      uint);
 
 // Nemotron: Dh=64, Ds=64, various H and G
-instantiate_ssm(half, float16, 64, 64, 16, 1)
-instantiate_ssm(half, float16, 64, 64, 16, 2)
-instantiate_ssm(half, float16, 64, 64, 16, 4)
-instantiate_ssm(half, float16, 64, 64, 16, 8)
-instantiate_ssm(half, float16, 64, 64, 32, 1)
-instantiate_ssm(half, float16, 64, 64, 32, 2)
-instantiate_ssm(half, float16, 64, 64, 32, 4)
-instantiate_ssm(half, float16, 64, 64, 32, 8)
-instantiate_ssm(half, float16, 64, 64, 48, 1)
-instantiate_ssm(half, float16, 64, 64, 48, 2)
-instantiate_ssm(half, float16, 64, 64, 48, 4)
-instantiate_ssm(half, float16, 64, 64, 48, 8)
+instantiate_ssm(half, float16, 64, 64, 16, 1) instantiate_ssm(
+    half,
+    float16,
+    64,
+    64,
+    16,
+    2) instantiate_ssm(half, float16, 64, 64, 16, 4)
+    instantiate_ssm(half, float16, 64, 64, 16, 8) instantiate_ssm(
+        half,
+        float16,
+        64,
+        64,
+        32,
+        1) instantiate_ssm(half, float16, 64, 64, 32, 2)
+        instantiate_ssm(half, float16, 64, 64, 32, 4) instantiate_ssm(
+            half,
+            float16,
+            64,
+            64,
+            32,
+            8) instantiate_ssm(half, float16, 64, 64, 48, 1)
+            instantiate_ssm(half, float16, 64, 64, 48, 2) instantiate_ssm(
+                half,
+                float16,
+                64,
+                64,
+                48,
+                4) instantiate_ssm(half, float16, 64, 64, 48, 8)
 
-instantiate_ssm(bfloat16_t, bfloat16, 64, 64, 16, 1)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 64, 16, 2)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 64, 16, 4)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 64, 16, 8)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 64, 32, 1)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 64, 32, 2)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 64, 32, 4)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 64, 32, 8)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 64, 48, 1)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 64, 48, 2)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 64, 48, 4)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 64, 48, 8)
+                instantiate_ssm(
+                    bfloat16_t,
+                    bfloat16,
+                    64,
+                    64,
+                    16,
+                    1) instantiate_ssm(bfloat16_t, bfloat16, 64, 64, 16, 2)
+                    instantiate_ssm(
+                        bfloat16_t,
+                        bfloat16,
+                        64,
+                        64,
+                        16,
+                        4) instantiate_ssm(bfloat16_t, bfloat16, 64, 64, 16, 8)
+                        instantiate_ssm(bfloat16_t, bfloat16, 64, 64, 32, 1)
+                            instantiate_ssm(bfloat16_t, bfloat16, 64, 64, 32, 2)
+                                instantiate_ssm(
+                                    bfloat16_t,
+                                    bfloat16,
+                                    64,
+                                    64,
+                                    32,
+                                    4)
+                                    instantiate_ssm(
+                                        bfloat16_t,
+                                        bfloat16,
+                                        64,
+                                        64,
+                                        32,
+                                        8)
+                                        instantiate_ssm(
+                                            bfloat16_t,
+                                            bfloat16,
+                                            64,
+                                            64,
+                                            48,
+                                            1)
+                                            instantiate_ssm(
+                                                bfloat16_t,
+                                                bfloat16,
+                                                64,
+                                                64,
+                                                48,
+                                                2)
+                                                instantiate_ssm(
+                                                    bfloat16_t,
+                                                    bfloat16,
+                                                    64,
+                                                    64,
+                                                    48,
+                                                    4)
+                                                    instantiate_ssm(
+                                                        bfloat16_t,
+                                                        bfloat16,
+                                                        64,
+                                                        64,
+                                                        48,
+                                                        8)
 
-// Nemotron: Dh=64, Ds=128
-instantiate_ssm(half, float16, 64, 128, 16, 1)
-instantiate_ssm(half, float16, 64, 128, 16, 2)
-instantiate_ssm(half, float16, 64, 128, 16, 4)
-instantiate_ssm(half, float16, 64, 128, 16, 8)
-instantiate_ssm(half, float16, 64, 128, 32, 1)
-instantiate_ssm(half, float16, 64, 128, 32, 2)
-instantiate_ssm(half, float16, 64, 128, 32, 4)
-instantiate_ssm(half, float16, 64, 128, 32, 8)
-instantiate_ssm(half, float16, 64, 128, 48, 1)
-instantiate_ssm(half, float16, 64, 128, 48, 2)
-instantiate_ssm(half, float16, 64, 128, 48, 4)
-instantiate_ssm(half, float16, 64, 128, 48, 8)
+    // Nemotron: Dh=64, Ds=128
+    instantiate_ssm(half, float16, 64, 128, 16, 1) instantiate_ssm(
+        half,
+        float16,
+        64,
+        128,
+        16,
+        2) instantiate_ssm(half, float16, 64, 128, 16, 4)
+        instantiate_ssm(half, float16, 64, 128, 16, 8) instantiate_ssm(
+            half,
+            float16,
+            64,
+            128,
+            32,
+            1) instantiate_ssm(half, float16, 64, 128, 32, 2)
+            instantiate_ssm(half, float16, 64, 128, 32, 4) instantiate_ssm(
+                half,
+                float16,
+                64,
+                128,
+                32,
+                8) instantiate_ssm(half, float16, 64, 128, 48, 1)
+                instantiate_ssm(half, float16, 64, 128, 48, 2) instantiate_ssm(
+                    half,
+                    float16,
+                    64,
+                    128,
+                    48,
+                    4) instantiate_ssm(half, float16, 64, 128, 48, 8)
 
-instantiate_ssm(bfloat16_t, bfloat16, 64, 128, 16, 1)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 128, 16, 2)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 128, 16, 4)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 128, 16, 8)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 128, 32, 1)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 128, 32, 2)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 128, 32, 4)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 128, 32, 8)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 128, 48, 1)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 128, 48, 2)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 128, 48, 4)
-instantiate_ssm(bfloat16_t, bfloat16, 64, 128, 48, 8)
+                    instantiate_ssm(
+                        bfloat16_t,
+                        bfloat16,
+                        64,
+                        128,
+                        16,
+                        1) instantiate_ssm(bfloat16_t, bfloat16, 64, 128, 16, 2)
+                        instantiate_ssm(bfloat16_t, bfloat16, 64, 128, 16, 4)
+                            instantiate_ssm(
+                                bfloat16_t,
+                                bfloat16,
+                                64,
+                                128,
+                                16,
+                                8)
+                                instantiate_ssm(
+                                    bfloat16_t,
+                                    bfloat16,
+                                    64,
+                                    128,
+                                    32,
+                                    1)
+                                    instantiate_ssm(
+                                        bfloat16_t,
+                                        bfloat16,
+                                        64,
+                                        128,
+                                        32,
+                                        2)
+                                        instantiate_ssm(
+                                            bfloat16_t,
+                                            bfloat16,
+                                            64,
+                                            128,
+                                            32,
+                                            4)
+                                            instantiate_ssm(
+                                                bfloat16_t,
+                                                bfloat16,
+                                                64,
+                                                128,
+                                                32,
+                                                8)
+                                                instantiate_ssm(
+                                                    bfloat16_t,
+                                                    bfloat16,
+                                                    64,
+                                                    128,
+                                                    48,
+                                                    1)
+                                                    instantiate_ssm(
+                                                        bfloat16_t,
+                                                        bfloat16,
+                                                        64,
+                                                        128,
+                                                        48,
+                                                        2)
+                                                        instantiate_ssm(
+                                                            bfloat16_t,
+                                                            bfloat16,
+                                                            64,
+                                                            128,
+                                                            48,
+                                                            4)
+                                                            instantiate_ssm(
+                                                                bfloat16_t,
+                                                                bfloat16,
+                                                                64,
+                                                                128,
+                                                                48,
+                                                                8)
 
-// Dh=128 variants
-instantiate_ssm(half, float16, 128, 64, 16, 1)
-instantiate_ssm(half, float16, 128, 64, 16, 2)
-instantiate_ssm(half, float16, 128, 64, 16, 4)
-instantiate_ssm(half, float16, 128, 64, 16, 8)
-instantiate_ssm(half, float16, 128, 64, 32, 1)
-instantiate_ssm(half, float16, 128, 64, 32, 2)
-instantiate_ssm(half, float16, 128, 64, 32, 4)
-instantiate_ssm(half, float16, 128, 64, 32, 8)
-instantiate_ssm(half, float16, 128, 64, 48, 1)
-instantiate_ssm(half, float16, 128, 64, 48, 2)
-instantiate_ssm(half, float16, 128, 64, 48, 4)
-instantiate_ssm(half, float16, 128, 64, 48, 8)
+    // Dh=128 variants
+    instantiate_ssm(half, float16, 128, 64, 16, 1) instantiate_ssm(
+        half,
+        float16,
+        128,
+        64,
+        16,
+        2) instantiate_ssm(half, float16, 128, 64, 16, 4)
+        instantiate_ssm(half, float16, 128, 64, 16, 8) instantiate_ssm(
+            half,
+            float16,
+            128,
+            64,
+            32,
+            1) instantiate_ssm(half, float16, 128, 64, 32, 2)
+            instantiate_ssm(half, float16, 128, 64, 32, 4) instantiate_ssm(
+                half,
+                float16,
+                128,
+                64,
+                32,
+                8) instantiate_ssm(half, float16, 128, 64, 48, 1)
+                instantiate_ssm(half, float16, 128, 64, 48, 2) instantiate_ssm(
+                    half,
+                    float16,
+                    128,
+                    64,
+                    48,
+                    4) instantiate_ssm(half, float16, 128, 64, 48, 8)
 
-instantiate_ssm(bfloat16_t, bfloat16, 128, 64, 16, 1)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 64, 16, 2)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 64, 16, 4)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 64, 16, 8)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 64, 32, 1)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 64, 32, 2)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 64, 32, 4)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 64, 32, 8)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 64, 48, 1)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 64, 48, 2)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 64, 48, 4)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 64, 48, 8)
+                    instantiate_ssm(bfloat16_t, bfloat16, 128, 64, 16, 1) instantiate_ssm(
+                        bfloat16_t,
+                        bfloat16,
+                        128,
+                        64,
+                        16,
+                        2) instantiate_ssm(bfloat16_t, bfloat16, 128, 64, 16, 4)
+                        instantiate_ssm(bfloat16_t, bfloat16, 128, 64, 16, 8) instantiate_ssm(
+                            bfloat16_t,
+                            bfloat16,
+                            128,
+                            64,
+                            32,
+                            1) instantiate_ssm(bfloat16_t, bfloat16, 128, 64, 32, 2)
+                            instantiate_ssm(bfloat16_t, bfloat16, 128, 64, 32, 4) instantiate_ssm(
+                                bfloat16_t,
+                                bfloat16,
+                                128,
+                                64,
+                                32,
+                                8) instantiate_ssm(bfloat16_t, bfloat16, 128, 64, 48, 1)
+                                instantiate_ssm(bfloat16_t, bfloat16, 128, 64, 48, 2) instantiate_ssm(
+                                    bfloat16_t,
+                                    bfloat16,
+                                    128,
+                                    64,
+                                    48,
+                                    4) instantiate_ssm(bfloat16_t, bfloat16, 128, 64, 48, 8)
 
-instantiate_ssm(half, float16, 128, 128, 16, 1)
-instantiate_ssm(half, float16, 128, 128, 16, 2)
-instantiate_ssm(half, float16, 128, 128, 16, 4)
-instantiate_ssm(half, float16, 128, 128, 16, 8)
-instantiate_ssm(half, float16, 128, 128, 32, 1)
-instantiate_ssm(half, float16, 128, 128, 32, 2)
-instantiate_ssm(half, float16, 128, 128, 32, 4)
-instantiate_ssm(half, float16, 128, 128, 32, 8)
-instantiate_ssm(half, float16, 128, 128, 48, 1)
-instantiate_ssm(half, float16, 128, 128, 48, 2)
-instantiate_ssm(half, float16, 128, 128, 48, 4)
-instantiate_ssm(half, float16, 128, 128, 48, 8)
+                                    instantiate_ssm(half, float16, 128, 128, 16, 1) instantiate_ssm(
+                                        half,
+                                        float16,
+                                        128,
+                                        128,
+                                        16,
+                                        2) instantiate_ssm(half, float16, 128, 128, 16, 4)
+                                        instantiate_ssm(half, float16, 128, 128, 16, 8) instantiate_ssm(
+                                            half,
+                                            float16,
+                                            128,
+                                            128,
+                                            32,
+                                            1) instantiate_ssm(half, float16, 128, 128, 32, 2)
+                                            instantiate_ssm(half, float16, 128, 128, 32, 4) instantiate_ssm(
+                                                half,
+                                                float16,
+                                                128,
+                                                128,
+                                                32,
+                                                8) instantiate_ssm(half, float16, 128, 128, 48, 1)
+                                                instantiate_ssm(half, float16, 128, 128, 48, 2) instantiate_ssm(
+                                                    half,
+                                                    float16,
+                                                    128,
+                                                    128,
+                                                    48,
+                                                    4) instantiate_ssm(half, float16, 128, 128, 48, 8)
 
-instantiate_ssm(bfloat16_t, bfloat16, 128, 128, 16, 1)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 128, 16, 2)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 128, 16, 4)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 128, 16, 8)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 128, 32, 1)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 128, 32, 2)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 128, 32, 4)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 128, 32, 8)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 128, 48, 1)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 128, 48, 2)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 128, 48, 4)
-instantiate_ssm(bfloat16_t, bfloat16, 128, 128, 48, 8)
+                                                    instantiate_ssm(bfloat16_t, bfloat16, 128, 128, 16, 1) instantiate_ssm(
+                                                        bfloat16_t,
+                                                        bfloat16,
+                                                        128,
+                                                        128,
+                                                        16,
+                                                        2) instantiate_ssm(bfloat16_t, bfloat16, 128, 128, 16, 4)
+                                                        instantiate_ssm(
+                                                            bfloat16_t,
+                                                            bfloat16,
+                                                            128,
+                                                            128,
+                                                            16,
+                                                            8)
+                                                            instantiate_ssm(
+                                                                bfloat16_t,
+                                                                bfloat16,
+                                                                128,
+                                                                128,
+                                                                32,
+                                                                1)
+                                                                instantiate_ssm(
+                                                                    bfloat16_t,
+                                                                    bfloat16,
+                                                                    128,
+                                                                    128,
+                                                                    32,
+                                                                    2)
+                                                                    instantiate_ssm(
+                                                                        bfloat16_t,
+                                                                        bfloat16,
+                                                                        128,
+                                                                        128,
+                                                                        32,
+                                                                        4)
+                                                                        instantiate_ssm(
+                                                                            bfloat16_t,
+                                                                            bfloat16,
+                                                                            128,
+                                                                            128,
+                                                                            32,
+                                                                            8)
+                                                                            instantiate_ssm(
+                                                                                bfloat16_t,
+                                                                                bfloat16,
+                                                                                128,
+                                                                                128,
+                                                                                48,
+                                                                                1)
+                                                                                instantiate_ssm(
+                                                                                    bfloat16_t,
+                                                                                    bfloat16,
+                                                                                    128,
+                                                                                    128,
+                                                                                    48,
+                                                                                    2)
+                                                                                    instantiate_ssm(
+                                                                                        bfloat16_t,
+                                                                                        bfloat16,
+                                                                                        128,
+                                                                                        128,
+                                                                                        48,
+                                                                                        4)
+                                                                                        instantiate_ssm(
+                                                                                            bfloat16_t,
+                                                                                            bfloat16,
+                                                                                            128,
+                                                                                            128,
+                                                                                            48,
+                                                                                            8)

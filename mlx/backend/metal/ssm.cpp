@@ -27,8 +27,7 @@ void SSMStep::eval_gpu(
   // with unique indices per thread, so the two can safely alias.
   // Donate state_in's buffer to avoid a second allocation.
   const auto& state_in = inputs[6];
-  if (state_in.is_donatable() &&
-      state_in.flags().row_contiguous &&
+  if (state_in.is_donatable() && state_in.flags().row_contiguous &&
       state_in.size() == state_out.size()) {
     state_out.copy_shared_buffer(state_in);
   } else {
@@ -37,9 +36,8 @@ void SSMStep::eval_gpu(
 
   // Build kernel name: ssm_step_{type}_{Dh}_{Ds}_{H}_{G}
   std::string tname = type_to_name(out.dtype());
-  std::string kname = "ssm_step_" + tname + "_" +
-                      std::to_string(Dh_) + "_" + std::to_string(Ds_) + "_" +
-                      std::to_string(H_) + "_" + std::to_string(G_);
+  std::string kname = "ssm_step_" + tname + "_" + std::to_string(Dh_) + "_" +
+      std::to_string(Ds_) + "_" + std::to_string(H_) + "_" + std::to_string(G_);
 
   auto kernel = d.get_kernel(kname);
 
@@ -74,8 +72,7 @@ void SSMStep::eval_gpu(
   // Grid: (32, Dh, H * batch)  ThreadGroup: (32, 8, 1)
   // threadgroups: (1, Dh/8, H * batch)
   compute_encoder.dispatch_threadgroups(
-      MTL::Size(1, Dh_ / 8, H_ * batch),
-      MTL::Size(32, 8, 1));
+      MTL::Size(1, Dh_ / 8, H_ * batch), MTL::Size(32, 8, 1));
 }
 
 bool SSMStep::is_equivalent(const Primitive& other) const {

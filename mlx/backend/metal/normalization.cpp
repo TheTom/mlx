@@ -136,7 +136,7 @@ void RMSNormQuantizedGEMV::eval_gpu(
   compute_encoder.set_bytes(N, 8);
   compute_encoder.dispatch_threadgroups(
       MTL::Size(1, n_tg_y, 1),
-      MTL::Size(64, 1, 1));  // 2 simdgroups × 32 threads
+      MTL::Size(64, 1, 1)); // 2 simdgroups × 32 threads
 }
 
 bool RMSNormQuantizedGEMV::is_equivalent(const Primitive& other) const {
@@ -159,7 +159,8 @@ void BatchedQKVQuantizedGEMV::eval_gpu(
   auto& s = stream();
   auto& d = metal::device(s.device);
 
-  // Inputs: x, w_q, scales_q, biases_q, w_k, scales_k, biases_k, w_v, scales_v, biases_v
+  // Inputs: x, w_q, scales_q, biases_q, w_k, scales_k, biases_k, w_v, scales_v,
+  // biases_v
   const array& x = inputs[0];
   const array& w_q = inputs[1];
   const array& scales_q = inputs[2];
@@ -212,22 +213,23 @@ void BatchedQKVQuantizedGEMV::eval_gpu(
 
   // z=3: one z-slice per matrix (Q, K, V), all run in parallel
   compute_encoder.dispatch_threadgroups(
-      MTL::Size(1, n_tg_y, 3),
-      MTL::Size(64, 1, 1));
+      MTL::Size(1, n_tg_y, 3), MTL::Size(64, 1, 1));
 }
 
 bool BatchedQKVQuantizedGEMV::is_equivalent(const Primitive& other) const {
   const BatchedQKVQuantizedGEMV& r =
       static_cast<const BatchedQKVQuantizedGEMV&>(other);
-  return group_size_ == r.group_size_ &&
-         n_q_ == r.n_q_ && n_k_ == r.n_k_ && n_v_ == r.n_v_;
+  return group_size_ == r.group_size_ && n_q_ == r.n_q_ && n_k_ == r.n_k_ &&
+      n_v_ == r.n_v_;
 }
 
 // ============================================================================
 // WarpMoeGateUp
 // ============================================================================
 
-bool WarpMoeGateUp::use_fallback(Stream s) { return s.device == Device::cpu; }
+bool WarpMoeGateUp::use_fallback(Stream s) {
+  return s.device == Device::cpu;
+}
 
 void WarpMoeGateUp::eval_gpu(
     const std::vector<array>& inputs,
@@ -236,13 +238,13 @@ void WarpMoeGateUp::eval_gpu(
   auto& d = metal::device(s.device);
 
   // Inputs: x, w, scales, biases, indices
-  const array& x = inputs[0];       // [inputDims] flattened
-  const array& w = inputs[1];       // [numExperts, 2*H, K_packed]
-  const array& sc = inputs[2];      // [numExperts, 2*H, K/gs]
-  const array& bi = inputs[3];      // [numExperts, 2*H, K/gs]
+  const array& x = inputs[0]; // [inputDims] flattened
+  const array& w = inputs[1]; // [numExperts, 2*H, K_packed]
+  const array& sc = inputs[2]; // [numExperts, 2*H, K/gs]
+  const array& bi = inputs[3]; // [numExperts, 2*H, K/gs]
   const array& indices = inputs[4]; // [topK]
 
-  auto& out = outputs[0];  // [topK, hiddenDims]
+  auto& out = outputs[0]; // [topK, hiddenDims]
   out.set_data(allocator::malloc(out.nbytes()));
 
   int in_vec_size = static_cast<int>(x.size());
@@ -268,22 +270,23 @@ void WarpMoeGateUp::eval_gpu(
   ce.set_bytes(top_k, 8);
 
   ce.dispatch_threadgroups(
-      MTL::Size(1, n_tg_y, top_k),  // z = topK experts in parallel
+      MTL::Size(1, n_tg_y, top_k), // z = topK experts in parallel
       MTL::Size(64, 1, 1));
 }
 
 bool WarpMoeGateUp::is_equivalent(const Primitive& other) const {
   const WarpMoeGateUp& r = static_cast<const WarpMoeGateUp&>(other);
-  return group_size_ == r.group_size_ &&
-         hidden_dims_ == r.hidden_dims_ &&
-         activation_type_ == r.activation_type_;
+  return group_size_ == r.group_size_ && hidden_dims_ == r.hidden_dims_ &&
+      activation_type_ == r.activation_type_;
 }
 
 // ============================================================================
 // WarpMoeDown
 // ============================================================================
 
-bool WarpMoeDown::use_fallback(Stream s) { return s.device == Device::cpu; }
+bool WarpMoeDown::use_fallback(Stream s) {
+  return s.device == Device::cpu;
+}
 
 void WarpMoeDown::eval_gpu(
     const std::vector<array>& inputs,
@@ -293,13 +296,13 @@ void WarpMoeDown::eval_gpu(
 
   // Inputs: activated, w, scales, biases, indices, scores
   const array& activated = inputs[0]; // [topK, hiddenDims]
-  const array& w = inputs[1];         // [numExperts, outDims, H_packed]
+  const array& w = inputs[1]; // [numExperts, outDims, H_packed]
   const array& sc = inputs[2];
   const array& bi = inputs[3];
-  const array& indices = inputs[4];   // [topK]
-  const array& scores = inputs[5];    // [topK]
+  const array& indices = inputs[4]; // [topK]
+  const array& scores = inputs[5]; // [topK]
 
-  auto& out = outputs[0];  // [outDims]
+  auto& out = outputs[0]; // [outDims]
   out.set_data(allocator::malloc(out.nbytes()));
 
   int top_k = static_cast<int>(indices.size());
@@ -324,16 +327,13 @@ void WarpMoeDown::eval_gpu(
   ce.set_bytes(out_dims_, 8);
   ce.set_bytes(top_k, 9);
 
-  ce.dispatch_threadgroups(
-      MTL::Size(1, n_tg_y, 1),
-      MTL::Size(64, 1, 1));
+  ce.dispatch_threadgroups(MTL::Size(1, n_tg_y, 1), MTL::Size(64, 1, 1));
 }
 
 bool WarpMoeDown::is_equivalent(const Primitive& other) const {
   const WarpMoeDown& r = static_cast<const WarpMoeDown&>(other);
-  return group_size_ == r.group_size_ &&
-         hidden_dims_ == r.hidden_dims_ &&
-         out_dims_ == r.out_dims_;
+  return group_size_ == r.group_size_ && hidden_dims_ == r.hidden_dims_ &&
+      out_dims_ == r.out_dims_;
 }
 
 bool RMSNormResidual::use_fallback(Stream s) {
@@ -349,7 +349,8 @@ void RMSNormResidual::eval_gpu(
 
   // Ensure x is contiguous in last dim
   const array& x_in = inputs[0];
-  bool no_copy = x_in.flags().contiguous && x_in.strides()[x_in.ndim() - 1] == 1;
+  bool no_copy =
+      x_in.flags().contiguous && x_in.strides()[x_in.ndim() - 1] == 1;
   if (no_copy && x_in.ndim() > 1) {
     auto st = x_in.strides()[x_in.ndim() - 2];
     no_copy &= (st == 0 || st == x_in.shape().back() || x_in.shape(-2) == 1);
@@ -358,7 +359,8 @@ void RMSNormResidual::eval_gpu(
 
   // Ensure residual is contiguous in last dim
   const array& r_in = inputs[1];
-  bool r_no_copy = r_in.flags().contiguous && r_in.strides()[r_in.ndim() - 1] == 1;
+  bool r_no_copy =
+      r_in.flags().contiguous && r_in.strides()[r_in.ndim() - 1] == 1;
   if (r_no_copy && r_in.ndim() > 1) {
     auto st = r_in.strides()[r_in.ndim() - 2];
     r_no_copy &= (st == 0 || st == r_in.shape().back() || r_in.shape(-2) == 1);
@@ -381,7 +383,8 @@ void RMSNormResidual::eval_gpu(
   std::string kname = "rms_norm_residual_" + type_to_name(out);
   auto kernel = d.get_kernel(kname);
 
-  // Use max threadgroup size — kernel loops over elements when axis_size > threadgroup
+  // Use max threadgroup size — kernel loops over elements when axis_size >
+  // threadgroup
   size_t threadgroup_size = kernel->maxTotalThreadsPerThreadgroup();
   size_t n_threads = n_rows * threadgroup_size;
 
@@ -394,8 +397,7 @@ void RMSNormResidual::eval_gpu(
   compute_encoder.set_bytes(eps_, 4);
   compute_encoder.set_bytes(axis_size, 5);
   compute_encoder.dispatch_threads(
-      MTL::Size(n_threads, 1, 1),
-      MTL::Size(threadgroup_size, 1, 1));
+      MTL::Size(n_threads, 1, 1), MTL::Size(threadgroup_size, 1, 1));
 }
 
 bool RMSNormResidual::is_equivalent(const Primitive& other) const {
@@ -447,9 +449,8 @@ void FusedGateActivation::eval_gpu(
   size_t simds_needed = (threads_needed + simd_size - 1) / simd_size;
   size_t single_row_tg = simd_size * simds_needed;
 
-  std::string kname_base =
-      "fused_gate_activation_" + std::string("") + type_to_name(out) + "_act" +
-      std::to_string(activation_type_);
+  std::string kname_base = "fused_gate_activation_" + std::string("") +
+      type_to_name(out) + "_act" + std::to_string(activation_type_);
 
   // Probe a single-row kernel first; fall back to looped if TG exceeds max.
   std::string single_row_name = "fused_gate_activation_single_row_" +
@@ -483,10 +484,9 @@ void FusedGateActivation::eval_gpu(
 }
 
 bool FusedGateActivation::is_equivalent(const Primitive& other) const {
-  const FusedGateActivation& r =
-      static_cast<const FusedGateActivation&>(other);
+  const FusedGateActivation& r = static_cast<const FusedGateActivation&>(other);
   return hidden_dims_ == r.hidden_dims_ &&
-         activation_type_ == r.activation_type_;
+      activation_type_ == r.activation_type_;
 }
 
 bool RMSNormRoPE::use_fallback(Stream s) {
@@ -502,7 +502,8 @@ void RMSNormRoPE::eval_gpu(
 
   // Ensure input is contiguous in last dim
   const array& x_in = inputs[0];
-  bool no_copy = x_in.flags().contiguous && x_in.strides()[x_in.ndim() - 1] == 1;
+  bool no_copy =
+      x_in.flags().contiguous && x_in.strides()[x_in.ndim() - 1] == 1;
   if (no_copy && x_in.ndim() > 1) {
     auto st = x_in.strides()[x_in.ndim() - 2];
     no_copy &= (st == 0 || st == x_in.shape().back() || x_in.shape(-2) == 1);
@@ -549,14 +550,13 @@ void RMSNormRoPE::eval_gpu(
   compute_encoder.set_bytes(n_heads_, 7);
   compute_encoder.set_bytes(seq_len_, 8);
   compute_encoder.dispatch_threads(
-      MTL::Size(n_threads, 1, 1),
-      MTL::Size(threadgroup_size, 1, 1));
+      MTL::Size(n_threads, 1, 1), MTL::Size(threadgroup_size, 1, 1));
 }
 
 bool RMSNormRoPE::is_equivalent(const Primitive& other) const {
   const RMSNormRoPE& r = static_cast<const RMSNormRoPE&>(other);
-  return eps_ == r.eps_ && n_heads_ == r.n_heads_ &&
-         seq_len_ == r.seq_len_ && offset_ == r.offset_;
+  return eps_ == r.eps_ && n_heads_ == r.n_heads_ && seq_len_ == r.seq_len_ &&
+      offset_ == r.offset_;
 }
 
 void RMSNormVJP::eval_gpu(

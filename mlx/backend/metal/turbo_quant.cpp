@@ -117,7 +117,8 @@ void TurboEncode::eval_gpu(
     auto group = MTL::Size(dim_, 1, 1);
     compute_encoder.dispatch_threadgroups(grid, group);
   } else {
-    // Dense rotation variant: inputs are [input, rotation, boundaries, codebook]
+    // Dense rotation variant: inputs are [input, rotation, boundaries,
+    // codebook]
     auto rotation = ensure_contiguous(inputs[1], s);
     auto boundaries = ensure_contiguous(inputs[2], s);
     auto codebook = ensure_contiguous(inputs[3], s);
@@ -486,8 +487,8 @@ void TurboBulkDequantRotated::eval_gpu(
           "TurboBulkDequantRotated: output dtype must be bfloat16 or float16");
   }
 
-  std::string kname = "turbo_dequant_rotated_" +
-      std::to_string(bits_) + "_" + std::to_string(dim_) + "_" + dtype_suffix;
+  std::string kname = "turbo_dequant_rotated_" + std::to_string(bits_) + "_" +
+      std::to_string(dim_) + "_" + dtype_suffix;
   auto kernel = d.get_kernel(kname);
 
   auto& compute_encoder = metal::get_command_encoder(s);
@@ -501,7 +502,8 @@ void TurboBulkDequantRotated::eval_gpu(
   // Grid: (PackedWidth, T, B*H). Threadgroup x clamped to 32 for SIMD-aligned
   // launches; pad grid x up to a multiple of group x.
   int group_x = std::min(packed_width, 32);
-  if (group_x < 1) group_x = 1;
+  if (group_x < 1)
+    group_x = 1;
   int grid_x = ((packed_width + group_x - 1) / group_x) * group_x;
   auto grid = MTL::Size(grid_x, T, B * H);
   auto group = MTL::Size(group_x, 1, 1);

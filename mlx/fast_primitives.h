@@ -155,14 +155,20 @@ class WarpMoeGateUp : public Custom {
         activation_type_(activation_type) {}
 
   static bool use_fallback(Stream stream);
-  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
     throw std::runtime_error("NYI");
   }
-  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override;
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
   DEFINE_NAME(WarpMoeGateUp)
   bool is_equivalent(const Primitive& other) const override;
   DEFINE_INPUT_OUTPUT_SHAPE()
-  auto state() const { return std::make_tuple(nullptr, group_size_, hidden_dims_, activation_type_); }
+  auto state() const {
+    return std::make_tuple(
+        nullptr, group_size_, hidden_dims_, activation_type_);
+  }
+
  private:
   int group_size_;
   int hidden_dims_;
@@ -183,14 +189,19 @@ class WarpMoeDown : public Custom {
         out_dims_(out_dims) {}
 
   static bool use_fallback(Stream stream);
-  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
     throw std::runtime_error("NYI");
   }
-  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override;
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
   DEFINE_NAME(WarpMoeDown)
   bool is_equivalent(const Primitive& other) const override;
   DEFINE_INPUT_OUTPUT_SHAPE()
-  auto state() const { return std::make_tuple(nullptr, group_size_, hidden_dims_, out_dims_); }
+  auto state() const {
+    return std::make_tuple(nullptr, group_size_, hidden_dims_, out_dims_);
+  }
+
  private:
   int group_size_;
   int hidden_dims_;
@@ -203,8 +214,7 @@ class RMSNormResidual : public Custom {
       Stream stream,
       std::function<std::vector<array>(std::vector<array>)> fallback,
       float eps)
-      : Custom(stream, std::move(fallback)),
-        eps_(eps) {}
+      : Custom(stream, std::move(fallback)), eps_(eps) {}
 
   static bool use_fallback(Stream stream);
 
@@ -942,8 +952,7 @@ class GatedDeltaStep : public Custom {
   DEFINE_INPUT_OUTPUT_SHAPE()
 
   auto state() const {
-    return std::make_tuple(
-        nullptr, fused_, has_mask_, T_, Dk_, Dv_, Hk_, Hv_);
+    return std::make_tuple(nullptr, fused_, has_mask_, T_, Dk_, Dv_, Hk_, Hv_);
   }
 
  private:
@@ -1069,11 +1078,7 @@ class SSMStep : public Custom {
       int Ds,
       int H,
       int G)
-      : Custom(stream, std::move(fallback)),
-        Dh_(Dh),
-        Ds_(Ds),
-        H_(H),
-        G_(G) {}
+      : Custom(stream, std::move(fallback)), Dh_(Dh), Ds_(Ds), H_(H), G_(G) {}
 
   static bool use_fallback(Stream stream);
 

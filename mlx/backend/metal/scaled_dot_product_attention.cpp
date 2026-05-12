@@ -175,7 +175,7 @@ void sdpa_full_self_attention_metal(
     const std::optional<array>& mask,
     const std::optional<array>& sinks) {
   if (metal::is_nax_available() && q.shape(3) != 80 &&
-      q.shape(3) <= 128 &&  // NAX BD=256 has zero-length array bug in NAXTile
+      q.shape(3) <= 128 && // NAX BD=256 has zero-length array bug in NAXTile
       (env::enable_tf32() || q.dtype() != float32)) {
     return sdpa_full_self_attention_nax(
         /* const Stream& s = */ s,
@@ -634,8 +634,7 @@ bool ScaledDotProductAttention::use_fallback(
   const bool sdpa_vector_supported_head_dim =
       query_head_dim == value_head_dim &&
       (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
-       query_head_dim == 256 ||
-       (query_head_dim == 512 && is_half));
+       query_head_dim == 256 || (query_head_dim == 512 && is_half));
 
   // Steel full attention avoids materializing L×L attention score matrices.
   // BD≤128: works for all dtypes.

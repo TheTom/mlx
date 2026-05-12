@@ -1,4 +1,5 @@
-// Copyright © 2026 Eric Kryski. TurboQuant Metal kernels for compressed-domain attention.
+// Copyright © 2026 Eric Kryski. TurboQuant Metal kernels for compressed-domain
+// attention.
 //
 // Framework-level compiled kernels. Runtime-varying parameters (token_count,
 // num_blocks, repeat_count, etc.) are buffer arguments instead of template
@@ -6,9 +7,9 @@
 //
 // Compile-time template params: Bits, Dim, PackedWidth (determine data layout).
 
+#include <metal_atomic>
 #include <metal_common>
 #include <metal_simdgroup>
-#include <metal_atomic>
 
 #include "mlx/backend/metal/kernels/utils.h"
 
@@ -27,7 +28,6 @@ template <int Bits, int Dim, int PackedWidth>
     constant int& token_count [[buffer(5)]],
     constant int& repeat_count [[buffer(6)]],
     uint3 pos [[thread_position_in_grid]]) {
-
   constexpr uint MASK = (1u << Bits) - 1u;
   constexpr uint LEVELS = 1u << Bits;
 
@@ -37,11 +37,13 @@ template <int Bits, int Dim, int PackedWidth>
   uint kv_idx = q_idx / uint(repeat_count);
 
   const device float* q_ptr = q_rot + q_idx * Dim;
-  const device uint32_t* packed_ptr = packed + kv_idx * uint(token_count) * PackedWidth + k_idx * PackedWidth;
+  const device uint32_t* packed_ptr =
+      packed + kv_idx * uint(token_count) * PackedWidth + k_idx * PackedWidth;
   float norm_val = norms[kv_idx * uint(token_count) + k_idx];
 
   float cb[LEVELS];
-  for (uint i = 0; i < LEVELS; i++) cb[i] = codebook[i];
+  for (uint i = 0; i < LEVELS; i++)
+    cb[i] = codebook[i];
 
   float acc = 0.0f;
   for (uint d = lane; d < uint(Dim); d += 32) {
@@ -76,7 +78,6 @@ template <int Bits, int Dim, int PackedWidth>
     device float* norms_out [[buffer(5)]],
     uint d [[thread_position_in_threadgroup]],
     uint row [[threadgroup_position_in_grid]]) {
-
   constexpr uint LEVELS = 1u << Bits;
 
   float val = input[row * Dim + d];
@@ -86,11 +87,13 @@ template <int Bits, int Dim, int PackedWidth>
   float norm_sq = simd_sum(sq);
   threadgroup float shared_norm[16];
   uint sg_id = d / 32;
-  if (d % 32 == 0) shared_norm[sg_id] = norm_sq;
+  if (d % 32 == 0)
+    shared_norm[sg_id] = norm_sq;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float total_norm_sq = 0;
   uint num_groups = (Dim + 31) / 32;
-  for (uint i = 0; i < num_groups; i++) total_norm_sq += shared_norm[i];
+  for (uint i = 0; i < num_groups; i++)
+    total_norm_sq += shared_norm[i];
   float norm_val = sqrt(total_norm_sq);
   float inv_norm = (norm_val > 1e-8f) ? (1.0f / norm_val) : 0.0f;
 
@@ -107,7 +110,8 @@ template <int Bits, int Dim, int PackedWidth>
 
   // Quantize via branchless boundary comparison
   uint idx = 0;
-  for (uint b = 0; b < LEVELS - 1; b++) idx += (uint)(rotated > boundaries[b]);
+  for (uint b = 0; b < LEVELS - 1; b++)
+    idx += (uint)(rotated > boundaries[b]);
 
   // Pack bits via atomic OR on threadgroup memory
   uint bit_offset = d * Bits;
@@ -118,32 +122,42 @@ template <int Bits, int Dim, int PackedWidth>
   // Sized for max PackedWidth across all instantiated (D, bits) combos:
   // D=512 B=8 → PW=128. Smaller (D, bits) use the prefix only.
   threadgroup uint shared_packed[128];
-  if (d < uint(PackedWidth)) shared_packed[d] = 0;
+  if (d < uint(PackedWidth))
+    shared_packed[d] = 0;
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  atomic_fetch_or_explicit((threadgroup atomic_uint*)&shared_packed[word_idx],
-                           masked << shift, memory_order_relaxed);
+  atomic_fetch_or_explicit(
+      (threadgroup atomic_uint*)&shared_packed[word_idx],
+      masked << shift,
+      memory_order_relaxed);
   int spill_bits = (int)shift + (int)Bits - 32;
   if (spill_bits > 0) {
-    atomic_fetch_or_explicit((threadgroup atomic_uint*)&shared_packed[word_idx + 1],
-                             masked >> ((uint)Bits - (uint)spill_bits), memory_order_relaxed);
+    atomic_fetch_or_explicit(
+        (threadgroup atomic_uint*)&shared_packed[word_idx + 1],
+        masked >> ((uint)Bits - (uint)spill_bits),
+        memory_order_relaxed);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  if (d < uint(PackedWidth)) packed_out[row * PackedWidth + d] = shared_packed[d];
+  if (d < uint(PackedWidth))
+    packed_out[row * PackedWidth + d] = shared_packed[d];
 
   // Norm correction
   float centroid_val = codebook[idx];
   float recon_sq = centroid_val * centroid_val;
   float recon_norm_sq = simd_sum(recon_sq);
-  if (d % 32 == 0) shared_norm[sg_id] = recon_norm_sq;
+  if (d % 32 == 0)
+    shared_norm[sg_id] = recon_norm_sq;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float total_recon_sq = 0;
-  for (uint i = 0; i < num_groups; i++) total_recon_sq += shared_norm[i];
+  for (uint i = 0; i < num_groups; i++)
+    total_recon_sq += shared_norm[i];
   float recon_norm = sqrt(total_recon_sq);
-  float corrected_norm = (recon_norm > 1e-8f) ? (norm_val / recon_norm) : norm_val;
+  float corrected_norm =
+      (recon_norm > 1e-8f) ? (norm_val / recon_norm) : norm_val;
 
-  if (d == 0) norms_out[row] = corrected_norm;
+  if (d == 0)
+    norms_out[row] = corrected_norm;
 }
 
 // ============================================================================
@@ -158,7 +172,6 @@ template <int Bits, int Dim, int PackedWidth, int LogDim>
     device float* norms_out [[buffer(4)]],
     uint d [[thread_position_in_threadgroup]],
     uint row [[threadgroup_position_in_grid]]) {
-
   constexpr uint LEVELS = 1u << Bits;
 
   float val = input[row * Dim + d];
@@ -168,11 +181,13 @@ template <int Bits, int Dim, int PackedWidth, int LogDim>
   float norm_sq = simd_sum(sq);
   threadgroup float shared_norm[16];
   uint sg_id = d / 32;
-  if (d % 32 == 0) shared_norm[sg_id] = norm_sq;
+  if (d % 32 == 0)
+    shared_norm[sg_id] = norm_sq;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float total_norm_sq = 0;
   uint num_groups = (Dim + 31) / 32;
-  for (uint i = 0; i < num_groups; i++) total_norm_sq += shared_norm[i];
+  for (uint i = 0; i < num_groups; i++)
+    total_norm_sq += shared_norm[i];
   float norm_val = sqrt(total_norm_sq);
   float inv_norm = (norm_val > 1e-8f) ? (1.0f / norm_val) : 0.0f;
 
@@ -216,7 +231,8 @@ template <int Bits, int Dim, int PackedWidth, int LogDim>
 
   // Quantize + pack (same as dense encode)
   uint idx = 0;
-  for (uint b = 0; b < LEVELS - 1; b++) idx += (uint)(rotated > boundaries[b]);
+  for (uint b = 0; b < LEVELS - 1; b++)
+    idx += (uint)(rotated > boundaries[b]);
 
   uint bit_offset = d * Bits;
   uint word_idx = bit_offset / 32;
@@ -226,20 +242,27 @@ template <int Bits, int Dim, int PackedWidth, int LogDim>
   // Sized for max PackedWidth across all instantiated (D, bits) combos:
   // D=512 B=8 → PW=128. Smaller (D, bits) use the prefix only.
   threadgroup uint shared_packed[128];
-  if (d < uint(PackedWidth)) shared_packed[d] = 0;
+  if (d < uint(PackedWidth))
+    shared_packed[d] = 0;
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  atomic_fetch_or_explicit((threadgroup atomic_uint*)&shared_packed[word_idx],
-                           masked << shift, memory_order_relaxed);
+  atomic_fetch_or_explicit(
+      (threadgroup atomic_uint*)&shared_packed[word_idx],
+      masked << shift,
+      memory_order_relaxed);
   int spill_bits = (int)shift + (int)Bits - 32;
   if (spill_bits > 0) {
-    atomic_fetch_or_explicit((threadgroup atomic_uint*)&shared_packed[word_idx + 1],
-                             masked >> ((uint)Bits - (uint)spill_bits), memory_order_relaxed);
+    atomic_fetch_or_explicit(
+        (threadgroup atomic_uint*)&shared_packed[word_idx + 1],
+        masked >> ((uint)Bits - (uint)spill_bits),
+        memory_order_relaxed);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  if (d < uint(PackedWidth)) packed_out[row * PackedWidth + d] = shared_packed[d];
-  if (d == 0) norms_out[row] = norm_val;  // WHT is orthogonal — no norm correction
+  if (d < uint(PackedWidth))
+    packed_out[row * PackedWidth + d] = shared_packed[d];
+  if (d == 0)
+    norms_out[row] = norm_val; // WHT is orthogonal — no norm correction
 }
 
 // ============================================================================
@@ -268,7 +291,6 @@ template <int Dim>
     device bfloat* output [[buffer(3)]],
     constant int& num_blocks [[buffer(4)]],
     uint3 pos [[thread_position_in_grid]]) {
-
   constexpr uint DIMS_PER_LANE = (Dim + 31) / 32;
   uint lane = pos.x;
   uint q_idx = pos.y;
@@ -276,13 +298,15 @@ template <int Dim>
   float m = -INFINITY;
   float l = 0.0f;
   float o[DIMS_PER_LANE];
-  for (uint i = 0; i < DIMS_PER_LANE; i++) o[i] = 0.0f;
+  for (uint i = 0; i < DIMS_PER_LANE; i++)
+    o[i] = 0.0f;
 
   for (uint b = 0; b < uint(num_blocks); b++) {
     uint ml_idx = q_idx * uint(num_blocks) + b;
     float block_m = m_partials[ml_idx];
     float block_l = l_partials[ml_idx];
-    if (block_l == 0.0f) continue;
+    if (block_l == 0.0f)
+      continue;
 
     float new_m = max(m, block_m);
     float exp_old = exp(m - new_m);
@@ -320,7 +344,6 @@ template <int Dim>
     device bfloat* output [[buffer(4)]],
     constant int& num_blocks [[buffer(5)]],
     uint3 pos [[thread_position_in_grid]]) {
-
   constexpr uint DIMS_PER_LANE = (Dim + 31) / 32;
   uint lane = pos.x;
   uint q_idx = pos.y;
@@ -328,13 +351,15 @@ template <int Dim>
   float m = -INFINITY;
   float l = 0.0f;
   float o[DIMS_PER_LANE];
-  for (uint i = 0; i < DIMS_PER_LANE; i++) o[i] = 0.0f;
+  for (uint i = 0; i < DIMS_PER_LANE; i++)
+    o[i] = 0.0f;
 
   for (uint b = 0; b < uint(num_blocks); b++) {
     uint ml_idx = q_idx * uint(num_blocks) + b;
     float block_m = m_partials[ml_idx];
     float block_l = l_partials[ml_idx];
-    if (block_l == 0.0f) continue;
+    if (block_l == 0.0f)
+      continue;
 
     float new_m = max(m, block_m);
     float exp_old = exp(m - new_m);
@@ -357,7 +382,8 @@ template <int Dim>
   threadgroup float shared_out[Dim];
   for (uint i = 0; i < DIMS_PER_LANE; i++) {
     uint d = lane + i * 32;
-    if (d < uint(Dim)) shared_out[d] = o[i] * inv_l;
+    if (d < uint(Dim))
+      shared_out[d] = o[i] * inv_l;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -388,7 +414,6 @@ template <int Bits, int Dim, int PackedWidth>
     constant int& repeat_count [[buffer(6)]],
     constant float& sparse_threshold [[buffer(7)]],
     uint3 pos [[thread_position_in_grid]]) {
-
   constexpr uint MASK = (1u << Bits) - 1u;
   constexpr uint LEVELS = 1u << Bits;
 
@@ -396,20 +421,24 @@ template <int Bits, int Dim, int PackedWidth>
   uint head_idx = pos.y;
   uint dim_block = pos.z;
   uint d = dim_block * 32 + lane;
-  if (d >= uint(Dim)) return;
+  if (d >= uint(Dim))
+    return;
 
   uint kv_head = head_idx / uint(repeat_count);
 
   float cb[LEVELS];
-  for (uint i = 0; i < LEVELS; i++) cb[i] = codebook[i];
+  for (uint i = 0; i < LEVELS; i++)
+    cb[i] = codebook[i];
 
   float acc = 0.0f;
   for (uint t = 0; t < uint(token_count); t++) {
     float w = weights[head_idx * uint(token_count) + t];
-    if (w < sparse_threshold) continue;
+    if (w < sparse_threshold)
+      continue;
 
     float norm_val = norms[kv_head * uint(token_count) + t];
-    const device uint32_t* packed_ptr = packed + kv_head * uint(token_count) * PackedWidth + t * PackedWidth;
+    const device uint32_t* packed_ptr =
+        packed + kv_head * uint(token_count) * PackedWidth + t * PackedWidth;
 
     uint bit_offset = d * Bits;
     uint word_idx = bit_offset / 32;
@@ -429,9 +458,9 @@ template <int Bits, int Dim, int PackedWidth>
 // ============================================================================
 // Bulk dequant in rotated codec space
 // ============================================================================
-// Decompresses [B, H, T, PackedWidth] uint32 + norms[B, H, T] + codebook[2^Bits]
-// into [B, H, T, Dim] FP16/BF16, in rotated Π space (caller applies the
-// inverse rotation downstream — typically by passing the output to
+// Decompresses [B, H, T, PackedWidth] uint32 + norms[B, H, T] +
+// codebook[2^Bits] into [B, H, T, Dim] FP16/BF16, in rotated Π space (caller
+// applies the inverse rotation downstream — typically by passing the output to
 // MLXFast.scaledDotProductAttention with the matching rotated query, then
 // matmul-by-V_rotation on the SDPA output).
 //
@@ -450,11 +479,11 @@ template <int Bits, int Dim, int PackedWidth, typename T>
     device T* out [[buffer(3)]],
     constant int& tokens [[buffer(4)]],
     uint3 pos [[thread_position_in_grid]]) {
-
   uint w = pos.x;
   uint t = pos.y;
   uint bh = pos.z;
-  if (w >= uint(PackedWidth) || t >= uint(tokens)) return;
+  if (w >= uint(PackedWidth) || t >= uint(tokens))
+    return;
 
   constexpr uint MASK = (1u << Bits) - 1u;
 
@@ -470,7 +499,8 @@ template <int Bits, int Dim, int PackedWidth, typename T>
     uint out_base = bh * uint(tokens) * Dim + t * Dim + d_base;
     for (uint k = 0; k < DIMS_PER_WORD; k++) {
       uint d = d_base + k;
-      if (d >= uint(Dim)) break;
+      if (d >= uint(Dim))
+        break;
       uint val = (word >> (k * Bits)) & MASK;
       float result = codebook[val] * norm_val;
       out[out_base + k] = static_cast<T>(result);
@@ -484,7 +514,8 @@ template <int Bits, int Dim, int PackedWidth, typename T>
     uint d_base = w * DIMS_PER_WORD;
     for (uint k = 0; k < DIMS_PER_WORD; k++) {
       uint d = d_base + k;
-      if (d >= uint(Dim)) break;
+      if (d >= uint(Dim))
+        break;
       uint bit_offset = d * Bits;
       uint word_idx = bit_offset / 32;
       uint shift = bit_offset % 32;
@@ -510,103 +541,152 @@ template <int Bits, int Dim, int PackedWidth, typename T>
 // PackedWidth = (Dim * Bits + 31) / 32
 #define TQ_PW(dim, bits) (((dim) * (bits) + 31) / 32)
 
-#define instantiate_turbo_score(bits, dim) \
-  template [[host_name("turbo_score_" #bits "_" #dim)]] \
-  [[kernel]] void turbo_score<bits, dim, TQ_PW(dim, bits)>( \
-    const device float*, const device uint32_t*, const device float*, \
-    const device float*, device float*, constant int&, constant int&, uint3);
+#define instantiate_turbo_score(bits, dim)                              \
+  template [[host_name("turbo_score_" #bits "_" #dim)]] [[kernel]] void \
+  turbo_score<bits, dim, TQ_PW(dim, bits)>(                             \
+      const device float*,                                              \
+      const device uint32_t*,                                           \
+      const device float*,                                              \
+      const device float*,                                              \
+      device float*,                                                    \
+      constant int&,                                                    \
+      constant int&,                                                    \
+      uint3);
 
-#define instantiate_turbo_encode(bits, dim) \
-  template [[host_name("turbo_fused_encode_" #bits "_" #dim)]] \
-  [[kernel]] void turbo_fused_encode<bits, dim, TQ_PW(dim, bits)>( \
-    const device float*, const device float*, const device float*, \
-    const device float*, device uint32_t*, device float*, uint, uint);
+#define instantiate_turbo_encode(bits, dim)                                    \
+  template [[host_name("turbo_fused_encode_" #bits "_" #dim)]] [[kernel]] void \
+  turbo_fused_encode<bits, dim, TQ_PW(dim, bits)>(                             \
+      const device float*,                                                     \
+      const device float*,                                                     \
+      const device float*,                                                     \
+      const device float*,                                                     \
+      device uint32_t*,                                                        \
+      device float*,                                                           \
+      uint,                                                                    \
+      uint);
 
-#define instantiate_turbo_encode_wht(bits, dim, logdim) \
-  template [[host_name("turbo_fused_encode_wht_" #bits "_" #dim)]] \
-  [[kernel]] void turbo_fused_encode_wht<bits, dim, TQ_PW(dim, bits), logdim>( \
-    const device float*, const device float*, const device float*, \
-    device uint32_t*, device float*, uint, uint);
+#define instantiate_turbo_encode_wht(bits, dim, logdim)                       \
+  template                                                                    \
+      [[host_name("turbo_fused_encode_wht_" #bits "_" #dim)]] [[kernel]] void \
+      turbo_fused_encode_wht<bits, dim, TQ_PW(dim, bits), logdim>(            \
+          const device float*,                                                \
+          const device float*,                                                \
+          const device float*,                                                \
+          device uint32_t*,                                                   \
+          device float*,                                                      \
+          uint,                                                               \
+          uint);
 
-#define instantiate_turbo_pass2(dim) \
-  template [[host_name("turbo_flash_p2_" #dim)]] \
-  [[kernel]] void turbo_flash_pass2<dim>( \
-    const device float*, const device float*, const device float*, \
-    device bfloat*, constant int&, uint3); \
-  template [[host_name("turbo_flash_p2_fused_" #dim)]] \
-  [[kernel]] void turbo_flash_pass2_fused_rot<dim>( \
-    const device float*, const device float*, const device float*, \
-    const device float*, device bfloat*, constant int&, uint3);
+#define instantiate_turbo_pass2(dim)                                   \
+  template [[host_name("turbo_flash_p2_" #dim)]] [[kernel]] void       \
+  turbo_flash_pass2<dim>(                                              \
+      const device float*,                                             \
+      const device float*,                                             \
+      const device float*,                                             \
+      device bfloat*,                                                  \
+      constant int&,                                                   \
+      uint3);                                                          \
+  template [[host_name("turbo_flash_p2_fused_" #dim)]] [[kernel]] void \
+  turbo_flash_pass2_fused_rot<dim>(                                    \
+      const device float*,                                             \
+      const device float*,                                             \
+      const device float*,                                             \
+      const device float*,                                             \
+      device bfloat*,                                                  \
+      constant int&,                                                   \
+      uint3);
 
-#define instantiate_turbo_value(bits, dim) \
-  template [[host_name("turbo_value_" #bits "_" #dim)]] \
-  [[kernel]] void turbo_value<bits, dim, TQ_PW(dim, bits)>( \
-    const device float*, const device uint32_t*, const device float*, \
-    const device float*, device float*, constant int&, constant int&, \
-    constant float&, uint3);
+#define instantiate_turbo_value(bits, dim)                              \
+  template [[host_name("turbo_value_" #bits "_" #dim)]] [[kernel]] void \
+  turbo_value<bits, dim, TQ_PW(dim, bits)>(                             \
+      const device float*,                                              \
+      const device uint32_t*,                                           \
+      const device float*,                                              \
+      const device float*,                                              \
+      device float*,                                                    \
+      constant int&,                                                    \
+      constant int&,                                                    \
+      constant float&,                                                  \
+      uint3);
 
 // Bulk dequant kernel — one host_name per (bits, dim, output dtype) tuple.
 // Output dtype suffix matches MLX's standard conventions: `bf16` and `f16`.
 #define instantiate_turbo_dequant_rotated(bits, dim, dtype, dtype_suffix) \
-  template [[host_name("turbo_dequant_rotated_" #bits "_" #dim "_" #dtype_suffix)]] \
-  [[kernel]] void turbo_dequant_rotated<bits, dim, TQ_PW(dim, bits), dtype>( \
-    const device uint32_t*, const device float*, const device float*, \
-    device dtype*, constant int&, uint3);
+  template [[host_name(                                                   \
+      "turbo_dequant_rotated_" #bits "_" #dim                             \
+      "_" #dtype_suffix)]] [[kernel]] void                                \
+  turbo_dequant_rotated<bits, dim, TQ_PW(dim, bits), dtype>(              \
+      const device uint32_t*,                                             \
+      const device float*,                                                \
+      const device float*,                                                \
+      device dtype*,                                                      \
+      constant int&,                                                      \
+      uint3);
 
 // Bits × Dim combinations for real models. Dim=512 added for Gemma 4
 // family (E2B, 26B-A4B, 31B), which uses headDim=512.
-#define instantiate_all_for_bits(bits) \
-  instantiate_turbo_score(bits, 64) \
-  instantiate_turbo_score(bits, 80) \
-  instantiate_turbo_score(bits, 96) \
-  instantiate_turbo_score(bits, 128) \
-  instantiate_turbo_score(bits, 256) \
-  instantiate_turbo_score(bits, 512) \
-  instantiate_turbo_encode(bits, 64) \
-  instantiate_turbo_encode(bits, 80) \
-  instantiate_turbo_encode(bits, 96) \
-  instantiate_turbo_encode(bits, 128) \
-  instantiate_turbo_encode(bits, 256) \
-  instantiate_turbo_encode(bits, 512) \
-  instantiate_turbo_value(bits, 64) \
-  instantiate_turbo_value(bits, 80) \
-  instantiate_turbo_value(bits, 96) \
-  instantiate_turbo_value(bits, 128) \
-  instantiate_turbo_value(bits, 256) \
-  instantiate_turbo_value(bits, 512) \
-  instantiate_turbo_dequant_rotated(bits, 64,  bfloat, bf16) \
-  instantiate_turbo_dequant_rotated(bits, 80,  bfloat, bf16) \
-  instantiate_turbo_dequant_rotated(bits, 96,  bfloat, bf16) \
-  instantiate_turbo_dequant_rotated(bits, 128, bfloat, bf16) \
-  instantiate_turbo_dequant_rotated(bits, 256, bfloat, bf16) \
-  instantiate_turbo_dequant_rotated(bits, 512, bfloat, bf16) \
-  instantiate_turbo_dequant_rotated(bits, 64,  half,   f16)  \
-  instantiate_turbo_dequant_rotated(bits, 80,  half,   f16)  \
-  instantiate_turbo_dequant_rotated(bits, 96,  half,   f16)  \
-  instantiate_turbo_dequant_rotated(bits, 128, half,   f16)  \
-  instantiate_turbo_dequant_rotated(bits, 256, half,   f16)  \
-  instantiate_turbo_dequant_rotated(bits, 512, half,   f16)
+#define instantiate_all_for_bits(bits)                                                           \
+  instantiate_turbo_score(bits, 64) instantiate_turbo_score(                                     \
+      bits,                                                                                      \
+      80) instantiate_turbo_score(bits, 96) instantiate_turbo_score(bits, 128)                   \
+      instantiate_turbo_score(bits, 256) instantiate_turbo_score(                                \
+          bits,                                                                                  \
+          512) instantiate_turbo_encode(bits, 64) instantiate_turbo_encode(bits, 80)             \
+          instantiate_turbo_encode(bits, 96) instantiate_turbo_encode(                           \
+              bits, 128) instantiate_turbo_encode(bits, 256)                                     \
+              instantiate_turbo_encode(bits, 512) instantiate_turbo_value(                       \
+                  bits, 64) instantiate_turbo_value(bits, 80)                                    \
+                  instantiate_turbo_value(bits, 96) instantiate_turbo_value(                     \
+                      bits, 128) instantiate_turbo_value(bits, 256)                              \
+                      instantiate_turbo_value(bits, 512) instantiate_turbo_dequant_rotated(      \
+                          bits,                                                                  \
+                          64,                                                                    \
+                          bfloat,                                                                \
+                          bf16) instantiate_turbo_dequant_rotated(bits, 80, bfloat, bf16)        \
+                          instantiate_turbo_dequant_rotated(                                     \
+                              bits, 96, bfloat, bf16)                                            \
+                              instantiate_turbo_dequant_rotated(                                 \
+                                  bits, 128, bfloat, bf16)                                       \
+                                  instantiate_turbo_dequant_rotated(                             \
+                                      bits, 256, bfloat, bf16)                                   \
+                                      instantiate_turbo_dequant_rotated(                         \
+                                          bits, 512, bfloat, bf16)                               \
+                                          instantiate_turbo_dequant_rotated(                     \
+                                              bits, 64, half, f16)                               \
+                                              instantiate_turbo_dequant_rotated(                 \
+                                                  bits, 80, half, f16)                           \
+                                                  instantiate_turbo_dequant_rotated(             \
+                                                      bits, 96, half, f16)                       \
+                                                      instantiate_turbo_dequant_rotated(         \
+                                                          bits,                                  \
+                                                          128,                                   \
+                                                          half,                                  \
+                                                          f16)                                   \
+                                                          instantiate_turbo_dequant_rotated(     \
+                                                              bits,                              \
+                                                              256,                               \
+                                                              half,                              \
+                                                              f16)                               \
+                                                              instantiate_turbo_dequant_rotated( \
+                                                                  bits,                          \
+                                                                  512,                           \
+                                                                  half,                          \
+                                                                  f16)
 
 // WHT encode only for power-of-2 dims
-#define instantiate_wht_for_bits(bits) \
-  instantiate_turbo_encode_wht(bits, 64, 6) \
-  instantiate_turbo_encode_wht(bits, 128, 7) \
-  instantiate_turbo_encode_wht(bits, 256, 8) \
-  instantiate_turbo_encode_wht(bits, 512, 9)
+#define instantiate_wht_for_bits(bits)               \
+  instantiate_turbo_encode_wht(bits, 64, 6)          \
+      instantiate_turbo_encode_wht(bits, 128, 7)     \
+          instantiate_turbo_encode_wht(bits, 256, 8) \
+              instantiate_turbo_encode_wht(bits, 512, 9)
 
-instantiate_all_for_bits(2)
-instantiate_all_for_bits(3)
-instantiate_all_for_bits(4)
-instantiate_all_for_bits(8)
+instantiate_all_for_bits(2) instantiate_all_for_bits(3)
+    instantiate_all_for_bits(4) instantiate_all_for_bits(8)
 
-instantiate_wht_for_bits(2)
-instantiate_wht_for_bits(3)
-instantiate_wht_for_bits(4)
-instantiate_wht_for_bits(8)
+        instantiate_wht_for_bits(2) instantiate_wht_for_bits(3)
+            instantiate_wht_for_bits(4) instantiate_wht_for_bits(8)
 
-instantiate_turbo_pass2(64)
-instantiate_turbo_pass2(80)
-instantiate_turbo_pass2(96)
-instantiate_turbo_pass2(128)
-instantiate_turbo_pass2(256)
-instantiate_turbo_pass2(512)
+                instantiate_turbo_pass2(64) instantiate_turbo_pass2(80)
+                    instantiate_turbo_pass2(96) instantiate_turbo_pass2(128)
+                        instantiate_turbo_pass2(256)
+                            instantiate_turbo_pass2(512)

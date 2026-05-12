@@ -28,8 +28,7 @@ void GatedDeltaStep::eval_gpu(
   // alias the same device buffer.  Donate state_in when possible to
   // avoid a second state-sized allocation per layer per token.
   const auto& state_in = inputs[fused_ ? 7 : 5];
-  if (state_in.is_donatable() &&
-      state_in.flags().row_contiguous &&
+  if (state_in.is_donatable() && state_in.flags().row_contiguous &&
       state_in.size() == state_out.size()) {
     state_out.copy_shared_buffer(state_in);
   } else {
@@ -40,13 +39,13 @@ void GatedDeltaStep::eval_gpu(
   std::string tname = type_to_name(y.dtype());
   std::string kname;
   if (fused_) {
-    kname = "gated_delta_step_fused_" + tname + "_" +
-            std::to_string(Dk_) + "_" + std::to_string(Dv_) + "_" +
-            std::to_string(Hk_) + "_" + std::to_string(Hv_);
+    kname = "gated_delta_step_fused_" + tname + "_" + std::to_string(Dk_) +
+        "_" + std::to_string(Dv_) + "_" + std::to_string(Hk_) + "_" +
+        std::to_string(Hv_);
   } else {
-    kname = "gated_delta_step_" + tname + "_" +
-            std::to_string(Dk_) + "_" + std::to_string(Dv_) + "_" +
-            std::to_string(Hk_) + "_" + std::to_string(Hv_);
+    kname = "gated_delta_step_" + tname + "_" + std::to_string(Dk_) + "_" +
+        std::to_string(Dv_) + "_" + std::to_string(Hk_) + "_" +
+        std::to_string(Hv_);
   }
 
   // Function constant for mask selection (index 10 in the .metal source)
@@ -132,14 +131,13 @@ void GatedDeltaStep::eval_gpu(
 
   // Grid: (32, Dv, B * Hv)  ThreadGroup: (32, 4, 1)
   compute_encoder.dispatch_threadgroups(
-      MTL::Size(1, Dv_ / 4, B * Hv_),
-      MTL::Size(32, 4, 1));
+      MTL::Size(1, Dv_ / 4, B * Hv_), MTL::Size(32, 4, 1));
 }
 
 bool GatedDeltaStep::is_equivalent(const Primitive& other) const {
   const GatedDeltaStep& o = static_cast<const GatedDeltaStep&>(other);
   return fused_ == o.fused_ && has_mask_ == o.has_mask_ && T_ == o.T_ &&
-         Dk_ == o.Dk_ && Dv_ == o.Dv_ && Hk_ == o.Hk_ && Hv_ == o.Hv_;
+      Dk_ == o.Dk_ && Dv_ == o.Dv_ && Hk_ == o.Hk_ && Hv_ == o.Hv_;
 }
 
 } // namespace mlx::core::fast

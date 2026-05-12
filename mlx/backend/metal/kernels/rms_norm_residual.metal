@@ -21,11 +21,14 @@ using namespace metal;
 /// Output: out = residual + weight * x * inv_rms
 ///
 /// Each threadgroup processes one row. Threads loop over elements when
-/// axis_size exceeds threadgroup size (e.g., hidden_size=2816 > max_threads=1024).
+/// axis_size exceeds threadgroup size (e.g., hidden_size=2816 >
+/// max_threads=1024).
 ///
-/// Phase 1: Each thread accumulates sum(x^2) over its elements via strided loop.
+/// Phase 1: Each thread accumulates sum(x^2) over its elements via strided
+/// loop.
 ///          SIMD + threadgroup reduction to get total sum.
-/// Phase 2: Each thread applies weight * x * inv_rms + residual over same elements.
+/// Phase 2: Each thread applies weight * x * inv_rms + residual over same
+/// elements.
 template <typename T>
 [[kernel]] void rms_norm_residual(
     const device T* x [[buffer(0)]],
@@ -88,13 +91,21 @@ template <typename T>
   }
 }
 
-#define instantiate_rms_norm_residual(name, type) \
-  template [[host_name("rms_norm_residual_" #name)]] \
-  [[kernel]] void rms_norm_residual<type>( \
-      const device type*, const device type*, const device type*, \
-      device type*, constant float&, constant uint&, \
-      uint, uint, uint, uint, uint);
+#define instantiate_rms_norm_residual(name, type)                    \
+  template [[host_name("rms_norm_residual_" #name)]] [[kernel]] void \
+  rms_norm_residual<type>(                                           \
+      const device type*,                                            \
+      const device type*,                                            \
+      const device type*,                                            \
+      device type*,                                                  \
+      constant float&,                                               \
+      constant uint&,                                                \
+      uint,                                                          \
+      uint,                                                          \
+      uint,                                                          \
+      uint,                                                          \
+      uint);
 
 instantiate_rms_norm_residual(float32, float)
-instantiate_rms_norm_residual(float16, half)
-instantiate_rms_norm_residual(bfloat16, bfloat16_t)
+    instantiate_rms_norm_residual(float16, half)
+        instantiate_rms_norm_residual(bfloat16, bfloat16_t)

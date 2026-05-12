@@ -5,11 +5,12 @@
 //
 // Two variants:
 // 1. Standard: pre-computed q, k (normalized), g, beta
-// 2. Fused: raw q, k (computes rmsNorm, g from aLog/a/dtBias, beta from sigmoid(b) internally)
+// 2. Fused: raw q, k (computes rmsNorm, g from aLog/a/dtBias, beta from
+// sigmoid(b) internally)
 
 #include <metal_common>
-#include <metal_simdgroup>
 #include <metal_math>
+#include <metal_simdgroup>
 
 #include "mlx/backend/metal/kernels/utils.h"
 
@@ -36,7 +37,6 @@ template <typename T, int Dk, int Dv, int Hk, int Hv>
     uint3 thread_pos [[thread_position_in_grid]],
     uint3 tg_pos [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]]) {
-
   constexpr int n_per_t = Dk / 32;
 
   auto n = thread_pos.z;
@@ -74,8 +74,8 @@ template <typename T, int Dk, int Dv, int Hk, int Hv>
       }
       kv_mem = simd_sum(kv_mem);
 
-      auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem)
-                   * static_cast<float>(beta_[hv_idx]);
+      auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem) *
+          static_cast<float>(beta_[hv_idx]);
 
       float out = 0.0f;
       for (int i = 0; i < n_per_t; ++i) {
@@ -120,7 +120,6 @@ template <typename T, int Dk, int Dv, int Hk, int Hv>
     uint3 thread_pos [[thread_position_in_grid]],
     uint3 tg_pos [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]]) {
-
   constexpr int n_per_t = Dk / 32;
   constexpr float inv_scale_sq = 1.0f / float(Dk);
   float inv_scale_single = rsqrt(float(Dk));
@@ -230,36 +229,60 @@ template <typename T, int Dk, int Dv, int Hk, int Hv>
 // Template params Hk and Hv must be known at compile time since they determine
 // pointer strides. Common configs for real models:
 
-#define instantiate_gdn(type, tname, dk, dv, hk, hv) \
-  template [[host_name("gated_delta_step_" #tname "_" #dk "_" #dv "_" #hk "_" #hv)]] \
-  [[kernel]] void gated_delta_step<type, dk, dv, hk, hv>( \
-    const device type*, const device type*, const device type*, \
-    const device type*, const device type*, const device type*, \
-    const device bool*, device type*, device type*, \
-    constant int&, uint3, uint3, uint); \
-  template [[host_name("gated_delta_step_fused_" #tname "_" #dk "_" #dv "_" #hk "_" #hv)]] \
-  [[kernel]] void gated_delta_step_fused<type, dk, dv, hk, hv>( \
-    const device type*, const device type*, const device type*, \
-    const device type*, const device type*, const device type*, \
-    const device type*, const device type*, const device bool*, \
-    device type*, device type*, constant int&, uint3, uint3, uint);
+#define instantiate_gdn(type, tname, dk, dv, hk, hv)           \
+  template [[host_name(                                        \
+      "gated_delta_step_" #tname "_" #dk "_" #dv "_" #hk       \
+      "_" #hv)]] [[kernel]] void                               \
+  gated_delta_step<type, dk, dv, hk, hv>(                      \
+      const device type*,                                      \
+      const device type*,                                      \
+      const device type*,                                      \
+      const device type*,                                      \
+      const device type*,                                      \
+      const device type*,                                      \
+      const device bool*,                                      \
+      device type*,                                            \
+      device type*,                                            \
+      constant int&,                                           \
+      uint3,                                                   \
+      uint3,                                                   \
+      uint);                                                   \
+  template [[host_name(                                        \
+      "gated_delta_step_fused_" #tname "_" #dk "_" #dv "_" #hk \
+      "_" #hv)]] [[kernel]] void                               \
+  gated_delta_step_fused<type, dk, dv, hk, hv>(                \
+      const device type*,                                      \
+      const device type*,                                      \
+      const device type*,                                      \
+      const device type*,                                      \
+      const device type*,                                      \
+      const device type*,                                      \
+      const device type*,                                      \
+      const device type*,                                      \
+      const device bool*,                                      \
+      device type*,                                            \
+      device type*,                                            \
+      constant int&,                                           \
+      uint3,                                                   \
+      uint3,                                                   \
+      uint);
 
 // Qwen3.5-A3B: Dk=192, Dv=128, Hk=4, Hv=4
 instantiate_gdn(half, float16, 192, 128, 4, 4)
-instantiate_gdn(bfloat16_t, bfloat16, 192, 128, 4, 4)
+    instantiate_gdn(bfloat16_t, bfloat16, 192, 128, 4, 4)
 
-// Qwen3.5 larger variants may have different dims
-instantiate_gdn(half, float16, 128, 128, 8, 8)
-instantiate_gdn(bfloat16_t, bfloat16, 128, 128, 8, 8)
-instantiate_gdn(half, float16, 64, 64, 8, 8)
-instantiate_gdn(bfloat16_t, bfloat16, 64, 64, 8, 8)
+    // Qwen3.5 larger variants may have different dims
+    instantiate_gdn(half, float16, 128, 128, 8, 8)
+        instantiate_gdn(bfloat16_t, bfloat16, 128, 128, 8, 8)
+            instantiate_gdn(half, float16, 64, 64, 8, 8)
+                instantiate_gdn(bfloat16_t, bfloat16, 64, 64, 8, 8)
 
-// Qwen3.5-35B: Dk=128, Dv=128, numHeads=16, numKVHeads=2
-instantiate_gdn(half, float16, 128, 128, 16, 32)
-instantiate_gdn(bfloat16_t, bfloat16, 128, 128, 16, 32)
+    // Qwen3.5-35B: Dk=128, Dv=128, numHeads=16, numKVHeads=2
+    instantiate_gdn(half, float16, 128, 128, 16, 32)
+        instantiate_gdn(bfloat16_t, bfloat16, 128, 128, 16, 32)
 
-// Qwen3.5 dense models: Dk=128, Dv=128, Hk=16, Hv=16 (0.8B-9B), Hv=48 (27B)
-instantiate_gdn(half, float16, 128, 128, 16, 16)
-instantiate_gdn(bfloat16_t, bfloat16, 128, 128, 16, 16)
-instantiate_gdn(half, float16, 128, 128, 16, 48)
-instantiate_gdn(bfloat16_t, bfloat16, 128, 128, 16, 48)
+    // Qwen3.5 dense models: Dk=128, Dv=128, Hk=16, Hv=16 (0.8B-9B), Hv=48 (27B)
+    instantiate_gdn(half, float16, 128, 128, 16, 16)
+        instantiate_gdn(bfloat16_t, bfloat16, 128, 128, 16, 16)
+            instantiate_gdn(half, float16, 128, 128, 16, 48)
+                instantiate_gdn(bfloat16_t, bfloat16, 128, 128, 16, 48)
