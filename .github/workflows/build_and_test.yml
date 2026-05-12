@@ -25,6 +25,9 @@ jobs:
 
   linux_build_and_test:
     name: Linux (cpu, ${{ matrix.arch }})
+    # Fork (ekryski/mlx) is macOS / Metal only — Linux coverage is upstream's
+    # responsibility. Our `alpha-ci.yml` runs the Mac build on the fork.
+    if: github.repository == 'ml-explore/mlx'
     needs: check_lint
     strategy:
       fail-fast: false
@@ -78,6 +81,8 @@ jobs:
 
   windows_build_and_test:
     name: Windows (cpu, x86_64)
+    # Fork is macOS / Metal only — see linux_build_and_test gate above.
+    if: github.repository == 'ml-explore/mlx'
     needs: check_lint
     runs-on: windows-2025
     steps:
@@ -97,6 +102,8 @@ jobs:
 
   linux_sanitizer_build_and_test:
     name: Linux Sanitizer Tests (${{ matrix.sanitizer }})
+    # Fork is macOS / Metal only — see linux_build_and_test gate above.
+    if: github.repository == 'ml-explore/mlx'
     needs: check_lint
     strategy:
       fail-fast: false
@@ -130,6 +137,8 @@ jobs:
 
   linux_fedora_build_cpp:
     name: Linux Fedora (${{ matrix.arch }})
+    # Fork is macOS / Metal only — see linux_build_and_test gate above.
+    if: github.repository == 'ml-explore/mlx'
     needs: check_lint
     strategy:
       fail-fast: false
