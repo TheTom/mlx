@@ -47,6 +47,7 @@ function(build_kernel KERNEL)
 endfunction(build_kernel)
 
 build_kernel(arg_reduce)
+build_kernel(batched_qkv_qgemv)
 build_kernel(conv steel/conv/params.h)
 build_kernel(fused_gate_activation)
 build_kernel(gemv steel/utils.h)
