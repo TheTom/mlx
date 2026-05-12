@@ -84,7 +84,7 @@ template <typename T, int group_size>
   constexpr int SIMD_SIZE = 32;
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
-  constexpr int pack_factor = 8; // 8 4-bit values per uint32
+  constexpr int pack_factor = 32 / bits; // values per uint32 = 8 at bits=4
   constexpr int values_per_thread = pack_factor; // 8
   constexpr int block_size = values_per_thread * SIMD_SIZE; // 256
   constexpr int bytes_per_pack = 4; // uint32 = 4 bytes
