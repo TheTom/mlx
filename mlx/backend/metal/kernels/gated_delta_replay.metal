@@ -287,7 +287,30 @@ instantiate_gdn_tape(bfloat16_t,  bfloat16, 128, 128, 16, 48)
 instantiate_gdn_tape(float,       float32,  128, 128, 16, 48)
 
 // Small-cell coverage for unit tests (matches mlx-swift-lm's
-// `SSMStateCacheTapeReplayTests` fixture: B=1, Hv=2, Hk=2, Dk=64, Dv=32).
+// `SSMStateCacheStateReplayTests` fixture: B=1, Hv=2, Hk=2, Dk=64, Dv=32).
 instantiate_gdn_tape(half,        float16,  64,  32,  2, 2)
 instantiate_gdn_tape(bfloat16_t,  bfloat16, 64,  32,  2, 2)
 instantiate_gdn_tape(float,       float32,  64,  32,  2, 2)
+
+// Hk == Hv variants needed by the **replay kernel** specifically. The
+// state-replay rollback consumes the cache's GQA-expanded k log, which
+// has Hk_effective = Hv (not the layer's original Hk). The dispatcher
+// in `MLXLMCommon/StateReplayKernels.swift::stateReplayUpdate` sets
+// `let Hk = Hv`, so we instantiate every (Dk, Dv, Hv, Hv) cell that
+// matches a real Qwen 3.5 / 3.6 variant.
+//
+// The forward kernel `gated_delta_step_record` still uses the layer's
+// original Hk, so the GQA-asymmetric cells above continue to apply on
+// the record path. Both surfaces share the same .metal source +
+// template — only the dispatcher decides which (Hk, Hv) tuple it asks
+// for, and both must be instantiated.
+
+// Qwen 3.5 / 3.6 35B: replay Hk=Hv=32 (forward uses Hk=16, Hv=32)
+instantiate_gdn_tape(half,        float16,  128, 128, 32, 32)
+instantiate_gdn_tape(bfloat16_t,  bfloat16, 128, 128, 32, 32)
+instantiate_gdn_tape(float,       float32,  128, 128, 32, 32)
+
+// Qwen 3.5 / 3.6 dense 27B: replay Hk=Hv=48 (forward uses Hk=16, Hv=48)
+instantiate_gdn_tape(half,        float16,  128, 128, 48, 48)
+instantiate_gdn_tape(bfloat16_t,  bfloat16, 128, 128, 48, 48)
+instantiate_gdn_tape(float,       float32,  128, 128, 48, 48)
