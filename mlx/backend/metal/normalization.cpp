@@ -347,6 +347,13 @@ void RMSNormResidual::eval_gpu(
   auto& d = metal::device(s.device);
   auto& out = outputs[0];
 
+  // Copies of inputs that needed contiguous_copy_gpu — registered via
+  // add_temporaries so the underlying MTL buffers stay alive until the
+  // command buffer completes (mirrors SDPA's pattern in
+  // scaled_dot_product_attention.cpp).
+  std::vector<array> copies;
+  copies.reserve(2);
+
   // Ensure x is contiguous in last dim
   const array& x_in = inputs[0];
   bool no_copy =
@@ -355,7 +362,11 @@ void RMSNormResidual::eval_gpu(
     auto st = x_in.strides()[x_in.ndim() - 2];
     no_copy &= (st == 0 || st == x_in.shape().back() || x_in.shape(-2) == 1);
   }
-  array x = no_copy ? x_in : contiguous_copy_gpu(x_in, s);
+  array x = x_in;
+  if (!no_copy) {
+    x = contiguous_copy_gpu(x_in, s);
+    copies.push_back(x);
+  }
 
   // Ensure residual is contiguous in last dim
   const array& r_in = inputs[1];
@@ -365,7 +376,11 @@ void RMSNormResidual::eval_gpu(
     auto st = r_in.strides()[r_in.ndim() - 2];
     r_no_copy &= (st == 0 || st == r_in.shape().back() || r_in.shape(-2) == 1);
   }
-  array residual = r_no_copy ? r_in : contiguous_copy_gpu(r_in, s);
+  array residual = r_in;
+  if (!r_no_copy) {
+    residual = contiguous_copy_gpu(r_in, s);
+    copies.push_back(residual);
+  }
 
   // Output allocation — must be fresh because kernel reads x and residual
   // while writing output (in-place would cause read-after-write hazard).
@@ -398,6 +413,7 @@ void RMSNormResidual::eval_gpu(
   compute_encoder.set_bytes(axis_size, 5);
   compute_encoder.dispatch_threads(
       MTL::Size(n_threads, 1, 1), MTL::Size(threadgroup_size, 1, 1));
+  compute_encoder.add_temporaries(std::move(copies));
 }
 
 bool RMSNormResidual::is_equivalent(const Primitive& other) const {
@@ -416,6 +432,10 @@ void FusedGateActivation::eval_gpu(
   auto& d = metal::device(s.device);
   auto& out = outputs[0];
 
+  // See RMSNormResidual::eval_gpu for the add_temporaries rationale.
+  std::vector<array> copies;
+  copies.reserve(1);
+
   // Ensure gate_up is contiguous in last dim.
   const array& gu_in = inputs[0];
   bool no_copy =
@@ -424,7 +444,11 @@ void FusedGateActivation::eval_gpu(
     auto st = gu_in.strides()[gu_in.ndim() - 2];
     no_copy &= (st == 0 || st == gu_in.shape().back() || gu_in.shape(-2) == 1);
   }
-  array gate_up = no_copy ? gu_in : contiguous_copy_gpu(gu_in, s);
+  array gate_up = gu_in;
+  if (!no_copy) {
+    gate_up = contiguous_copy_gpu(gu_in, s);
+    copies.push_back(gate_up);
+  }
 
   // Output buffer — distinct from input (output has half the size in the
   // last axis). Donation is not possible because the allocation sizes
@@ -481,6 +505,7 @@ void FusedGateActivation::eval_gpu(
   compute_encoder.set_bytes(hidden, 2);
   compute_encoder.dispatch_threads(
       MTL::Size(n_threads, 1, 1), MTL::Size(threadgroup_size, 1, 1));
+  compute_encoder.add_temporaries(std::move(copies));
 }
 
 bool FusedGateActivation::is_equivalent(const Primitive& other) const {
