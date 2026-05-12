@@ -24,11 +24,28 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/alpha' }}
 
 jobs:
+  lint:
+    if: github.repository_owner == 'ekryski'
+    name: Check Lint
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pre-commit/action@v3.0.1
+      - name: Fix hint
+        if: failure()
+        run: |
+          echo "::error::Lint failed. To fix locally before pushing again:"
+          echo "::error::  ./scripts/setup-dev.sh    # one-time: installs pre-commit + the git hook"
+          echo "::error::  pre-commit run --all-files  # apply fixes to your working tree"
+          echo "::error::  git add -A && git commit --amend --no-edit && git push --force-with-lease"
+
   build:
     if: github.repository_owner == 'ekryski'
     name: Build (M1 macOS)
     runs-on: macos-26
     timeout-minutes: 90
+    needs: lint
     steps:
       - uses: actions/checkout@v6
 
