@@ -198,7 +198,8 @@ array fused_gate_activation(
       activated = multiply(gate, sigmoid(gate, s), s);
       return std::vector<array>{multiply(activated, up, s)};
     } else if (activation_type == 1) {
-      // gelu_approx(gate) = 0.5 * gate * (1 + tanh(sqrt(2/pi) * (gate + 0.044715 * gate^3)))
+      // gelu_approx(gate) = 0.5 * gate * (1 + tanh(sqrt(2/pi) * (gate +
+      // 0.044715 * gate^3)))
       auto gate3 = multiply(multiply(gate, gate, s), gate, s);
       auto inner = multiply(
           array(0.7978845608f, gate.dtype()),
@@ -206,14 +207,12 @@ array fused_gate_activation(
           s);
       activated = multiply(
           array(0.5f, gate.dtype()),
-          multiply(
-              gate,
-              add(array(1.0f, gate.dtype()), tanh(inner, s), s),
-              s),
+          multiply(gate, add(array(1.0f, gate.dtype()), tanh(inner, s), s), s),
           s);
       return std::vector<array>{multiply(activated, up, s)};
     } else {
-      // clipped swiglu (GPT-OSS): out = g·sigmoid(1.702·g)·(u + 1) with g, u clamped to [-7, 7]
+      // clipped swiglu (GPT-OSS): out = g·sigmoid(1.702·g)·(u + 1) with g, u
+      // clamped to [-7, 7]
       auto seven = array(7.0f, gate.dtype());
       auto neg_seven = array(-7.0f, gate.dtype());
       auto g = minimum(maximum(gate, neg_seven, s), seven, s);
@@ -256,31 +255,30 @@ array rms_norm_rope(
 
   auto out_type = result_type(x, weight);
   if (!issubdtype(out_type, floating)) {
-    throw std::invalid_argument(
-        "[rms_norm_rope] Input must be floating point");
+    throw std::invalid_argument("[rms_norm_rope] Input must be floating point");
   }
 
   auto s = to_stream(s_);
 
-  auto fallback = [eps, offset, n_heads, seq_len, s](
-                      const std::vector<array>& inputs) {
-    // Fallback: separate rms_norm + rope via MLX ops
-    auto normed = rms_norm(inputs[0], inputs[1], eps, s);
-    // Transpose [B, L, H, D] -> [B, H, L, D] for RoPE, then back
-    auto transposed = transpose(normed, {0, 2, 1, 3}, s);
-    // RoPE with custom frequencies
-    auto rotated = rope(
-        transposed,
-        transposed.shape(-1),
-        false,  // non-traditional
-        0.0f,   // base (unused when freqs provided)
-        1.0f,   // scale
-        offset,
-        inputs[2],  // inv_freqs as freqs (RoPE will invert them)
-        s);
-    auto result = transpose(rotated, {0, 2, 1, 3}, s);
-    return std::vector<array>{result};
-  };
+  auto fallback =
+      [eps, offset, n_heads, seq_len, s](const std::vector<array>& inputs) {
+        // Fallback: separate rms_norm + rope via MLX ops
+        auto normed = rms_norm(inputs[0], inputs[1], eps, s);
+        // Transpose [B, L, H, D] -> [B, H, L, D] for RoPE, then back
+        auto transposed = transpose(normed, {0, 2, 1, 3}, s);
+        // RoPE with custom frequencies
+        auto rotated = rope(
+            transposed,
+            transposed.shape(-1),
+            false, // non-traditional
+            0.0f, // base (unused when freqs provided)
+            1.0f, // scale
+            offset,
+            inputs[2], // inv_freqs as freqs (RoPE will invert them)
+            s);
+        auto result = transpose(rotated, {0, 2, 1, 3}, s);
+        return std::vector<array>{result};
+      };
 
   if (!RMSNormRoPE::use_fallback(s)) {
     return array(
@@ -322,8 +320,15 @@ array rms_norm_qgemv(
   auto fallback = [eps, group_size, s](const std::vector<array>& inputs) {
     auto normed = rms_norm(inputs[0], inputs[1], eps, s);
     auto result = quantized_matmul(
-        normed, inputs[2], inputs[3], inputs[4],
-        true, group_size, 4, "affine", s);
+        normed,
+        inputs[2],
+        inputs[3],
+        inputs[4],
+        true,
+        group_size,
+        4,
+        "affine",
+        s);
     return std::vector<array>{result};
   };
 
@@ -363,7 +368,6 @@ array batched_qkv_qgemv(
     const array& biases_v,
     int group_size,
     StreamOrDevice s_) {
-
   int K = x.shape().back();
   int N_q = w_q.shape(0);
   int N_k = w_k.shape(0);
@@ -372,18 +376,40 @@ array batched_qkv_qgemv(
   auto s = to_stream(s_);
 
   // Fallback: 3 separate quantized_matmul, concatenated
-  auto fallback = [group_size, N_q, N_k, N_v, s](const std::vector<array>& inputs) {
-    auto q = quantized_matmul(
-        inputs[0], inputs[1], inputs[2], inputs[3],
-        true, group_size, 4, "affine", s);
-    auto k = quantized_matmul(
-        inputs[0], inputs[4], inputs[5], inputs[6],
-        true, group_size, 4, "affine", s);
-    auto v = quantized_matmul(
-        inputs[0], inputs[7], inputs[8], inputs[9],
-        true, group_size, 4, "affine", s);
-    return std::vector<array>{concatenate({q, k, v}, -1, s)};
-  };
+  auto fallback =
+      [group_size, N_q, N_k, N_v, s](const std::vector<array>& inputs) {
+        auto q = quantized_matmul(
+            inputs[0],
+            inputs[1],
+            inputs[2],
+            inputs[3],
+            true,
+            group_size,
+            4,
+            "affine",
+            s);
+        auto k = quantized_matmul(
+            inputs[0],
+            inputs[4],
+            inputs[5],
+            inputs[6],
+            true,
+            group_size,
+            4,
+            "affine",
+            s);
+        auto v = quantized_matmul(
+            inputs[0],
+            inputs[7],
+            inputs[8],
+            inputs[9],
+            true,
+            group_size,
+            4,
+            "affine",
+            s);
+        return std::vector<array>{concatenate({q, k, v}, -1, s)};
+      };
 
   // Output shape: [..., N_q + N_k + N_v]
   auto out_shape = x.shape();
@@ -396,16 +422,28 @@ array batched_qkv_qgemv(
         std::make_shared<BatchedQKVQuantizedGEMV>(
             s, fallback, group_size, N_q, N_k, N_v),
         {astype(x, out_type, s),
-         w_q, astype(scales_q, out_type, s), astype(biases_q, out_type, s),
-         w_k, astype(scales_k, out_type, s), astype(biases_k, out_type, s),
-         w_v, astype(scales_v, out_type, s), astype(biases_v, out_type, s)});
+         w_q,
+         astype(scales_q, out_type, s),
+         astype(biases_q, out_type, s),
+         w_k,
+         astype(scales_k, out_type, s),
+         astype(biases_k, out_type, s),
+         w_v,
+         astype(scales_v, out_type, s),
+         astype(biases_v, out_type, s)});
   }
 
   return fallback(
       {astype(x, out_type, s),
-       w_q, astype(scales_q, out_type, s), astype(biases_q, out_type, s),
-       w_k, astype(scales_k, out_type, s), astype(biases_k, out_type, s),
-       w_v, astype(scales_v, out_type, s), astype(biases_v, out_type, s)})[0];
+       w_q,
+       astype(scales_q, out_type, s),
+       astype(biases_q, out_type, s),
+       w_k,
+       astype(scales_k, out_type, s),
+       astype(biases_k, out_type, s),
+       w_v,
+       astype(scales_v, out_type, s),
+       astype(biases_v, out_type, s)})[0];
 }
 
 // ============================================================================
@@ -421,15 +459,15 @@ array warp_moe_gate_up(
     int hidden_dims,
     int activation_type,
     StreamOrDevice s_) {
-
   auto out_type = x.dtype();
   auto s = to_stream(s_);
   int top_k = indices.shape(0);
 
   auto fallback = [group_size, hidden_dims, activation_type, s](
-      const std::vector<array>& inputs) -> std::vector<array> {
+                      const std::vector<array>& inputs) -> std::vector<array> {
     // Fallback: use gatherQuantizedMM + split + activation
-    throw std::runtime_error("WarpMoeGateUp fallback NYI — use gatherQuantizedMM path");
+    throw std::runtime_error(
+        "WarpMoeGateUp fallback NYI — use gatherQuantizedMM path");
   };
 
   Shape out_shape = {top_k, hidden_dims};
@@ -441,12 +479,17 @@ array warp_moe_gate_up(
         std::make_shared<WarpMoeGateUp>(
             s, fallback, group_size, hidden_dims, activation_type),
         {flatten(astype(x, out_type, s)),
-         w, astype(scales, out_type, s), astype(biases, out_type, s),
+         w,
+         astype(scales, out_type, s),
+         astype(biases, out_type, s),
          astype(indices, int32, s)});
   }
-  return fallback({flatten(astype(x, out_type, s)),
-      w, astype(scales, out_type, s), astype(biases, out_type, s),
-      astype(indices, int32, s)})[0];
+  return fallback(
+      {flatten(astype(x, out_type, s)),
+       w,
+       astype(scales, out_type, s),
+       astype(biases, out_type, s),
+       astype(indices, int32, s)})[0];
 }
 
 // ============================================================================
@@ -463,13 +506,13 @@ array warp_moe_down(
     int hidden_dims,
     int out_dims,
     StreamOrDevice s_) {
-
   auto out_type = activated.dtype();
   auto s = to_stream(s_);
 
   auto fallback = [group_size, hidden_dims, out_dims, s](
-      const std::vector<array>& inputs) -> std::vector<array> {
-    throw std::runtime_error("WarpMoeDown fallback NYI — use gatherQuantizedMM path");
+                      const std::vector<array>& inputs) -> std::vector<array> {
+    throw std::runtime_error(
+        "WarpMoeDown fallback NYI — use gatherQuantizedMM path");
   };
 
   Shape out_shape = {out_dims};
@@ -481,13 +524,19 @@ array warp_moe_down(
         std::make_shared<WarpMoeDown>(
             s, fallback, group_size, hidden_dims, out_dims),
         {astype(activated, out_type, s),
-         w, astype(scales, out_type, s), astype(biases, out_type, s),
+         w,
+         astype(scales, out_type, s),
+         astype(biases, out_type, s),
          astype(indices, int32, s),
          astype(scores, out_type, s)});
   }
-  return fallback({astype(activated, out_type, s),
-      w, astype(scales, out_type, s), astype(biases, out_type, s),
-      astype(indices, int32, s), astype(scores, out_type, s)})[0];
+  return fallback(
+      {astype(activated, out_type, s),
+       w,
+       astype(scales, out_type, s),
+       astype(biases, out_type, s),
+       astype(indices, int32, s),
+       astype(scores, out_type, s)})[0];
 }
 
 std::vector<array> RMSNorm::vjp(
@@ -1760,9 +1809,7 @@ array turbo_bulk_dequant_rotated(
       output_dtype,
       std::make_shared<TurboBulkDequantRotated>(
           s, fallback, bits, dim, output_dtype),
-      {packed,
-       astype(norms, float32, s),
-       astype(codebook, float32, s)});
+      {packed, astype(norms, float32, s), astype(codebook, float32, s)});
 }
 
 // ============================================================================

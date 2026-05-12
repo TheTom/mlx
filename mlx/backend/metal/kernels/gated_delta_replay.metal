@@ -26,8 +26,8 @@
 // Qwen 3.6 share the same GDN config structure.
 
 #include <metal_common>
-#include <metal_simdgroup>
 #include <metal_math>
+#include <metal_simdgroup>
 
 #include "mlx/backend/metal/kernels/utils.h"
 
@@ -65,7 +65,6 @@ template <typename T, int Dk, int Dv, int Hk, int Hv>
     uint3 thread_pos [[thread_position_in_grid]],
     uint3 tg_pos [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]]) {
-
   constexpr int n_per_t = Dk / 32;
 
   auto n = thread_pos.z;
@@ -104,8 +103,8 @@ template <typename T, int Dk, int Dv, int Hk, int Hv>
       }
       kv_mem = simd_sum(kv_mem);
 
-      auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem)
-                   * static_cast<float>(beta_[hv_idx]);
+      auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem) *
+          static_cast<float>(beta_[hv_idx]);
 
       // Tape write: one lane per SIMD group writes delta. All SIMD lanes
       // hold the same value post-simd_sum, so any lane suffices. Same
@@ -155,22 +154,21 @@ template <typename T, int Dk, int Dv, int Hk, int Hv>
 
 template <typename T, int Dk, int Dv, int Hk, int Hv>
 [[kernel]] void state_replay(
-    const device T*    delta_log [[buffer(0)]],
-    const device T*    k_log     [[buffer(1)]],
-    const device T*    g_log     [[buffer(2)]],
-    const device T*    state_in   [[buffer(3)]],
-    const device bool* mask       [[buffer(4)]],
-    device T*          state_out  [[buffer(5)]],
-    constant int&      T_log     [[buffer(6)]],
-    constant int&      accepted   [[buffer(7)]],
-    uint3              thread_pos [[thread_position_in_grid]],
-    uint3              tg_pos     [[thread_position_in_threadgroup]],
-    uint               simd_lane  [[thread_index_in_simdgroup]]) {
-
+    const device T* delta_log [[buffer(0)]],
+    const device T* k_log [[buffer(1)]],
+    const device T* g_log [[buffer(2)]],
+    const device T* state_in [[buffer(3)]],
+    const device bool* mask [[buffer(4)]],
+    device T* state_out [[buffer(5)]],
+    constant int& T_log [[buffer(6)]],
+    constant int& accepted [[buffer(7)]],
+    uint3 thread_pos [[thread_position_in_grid]],
+    uint3 tg_pos [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]]) {
   constexpr int n_per_t = Dk / 32;
 
-  auto n      = thread_pos.z;
-  auto b_idx  = n / Hv;
+  auto n = thread_pos.z;
+  auto b_idx = n / Hv;
   auto hv_idx = n % Hv;
 
   auto dk_idx = tg_pos.x;
@@ -180,11 +178,11 @@ template <typename T, int Dk, int Dv, int Hk, int Hv>
   // k_log:     [B, T_log, Hv, Dk]  (already GQA-expanded by the cache)
   // g_log:     [B, T_log, Hv]
   auto delta_ = delta_log + b_idx * T_log * Hv * Dv + hv_idx * Dv;
-  auto k_     = k_log     + b_idx * T_log * Hv * Dk + hv_idx * Dk;
-  auto g_     = g_log     + b_idx * T_log * Hv;
+  auto k_ = k_log + b_idx * T_log * Hv * Dk + hv_idx * Dk;
+  auto g_ = g_log + b_idx * T_log * Hv;
 
   // state_in, state_out: [B, Hv, Dv, Dk]
-  auto i_state = state_in  + (n * Dv + dv_idx) * Dk;
+  auto i_state = state_in + (n * Dv + dv_idx) * Dk;
   auto o_state = state_out + (n * Dv + dv_idx) * Dk;
 
   float state[n_per_t];
@@ -194,10 +192,8 @@ template <typename T, int Dk, int Dv, int Hk, int Hv>
 
   for (int t = 0; t < T_log; ++t) {
     bool within_accepted = (t < accepted);
-    bool mask_passes     = state_replay_has_mask
-                              ? mask[b_idx * T_log + t]
-                              : true;
-    bool do_step         = within_accepted && mask_passes;
+    bool mask_passes = state_replay_has_mask ? mask[b_idx * T_log + t] : true;
+    bool do_step = within_accepted && mask_passes;
 
     // Save old_state for masked / out-of-range positions. Stack-allocated;
     // the compiler holds these in registers alongside `state[i]`.
@@ -211,16 +207,15 @@ template <typename T, int Dk, int Dv, int Hk, int Hv>
 
     for (int i = 0; i < n_per_t; ++i) {
       auto s_idx = n_per_t * dk_idx + i;
-      float new_val = state[i] * g_val
-                    + static_cast<float>(k_[s_idx]) * d_val;
+      float new_val = state[i] * g_val + static_cast<float>(k_[s_idx]) * d_val;
       state[i] = metal::select(old_state[i], new_val, do_step);
     }
 
     // Advance pointers regardless of do_step so the indexing stays in
     // lockstep with the tape layout.
     delta_ += Hv * Dv;
-    k_     += Hv * Dk;
-    g_     += Hv;
+    k_ += Hv * Dk;
+    g_ += Hv;
   }
 
   for (int i = 0; i < n_per_t; ++i) {
@@ -237,18 +232,40 @@ template <typename T, int Dk, int Dv, int Hk, int Hv>
 // different (Dk, Dv, Hk, Hv) tuples, add them here and to `gated_delta.metal`
 // to keep parity.
 
-#define instantiate_gdn_tape(type, tname, dk, dv, hk, hv) \
-  template [[host_name("gated_delta_step_record_" #tname "_" #dk "_" #dv "_" #hk "_" #hv)]] \
-  [[kernel]] void gated_delta_step_record<type, dk, dv, hk, hv>( \
-    const device type*, const device type*, const device type*, \
-    const device type*, const device type*, const device type*, \
-    const device bool*, device type*, device type*, device type*, \
-    constant int&, uint3, uint3, uint); \
-  template [[host_name("state_replay_" #tname "_" #dk "_" #dv "_" #hk "_" #hv)]] \
-  [[kernel]] void state_replay<type, dk, dv, hk, hv>( \
-    const device type*, const device type*, const device type*, \
-    const device type*, const device bool*, device type*, \
-    constant int&, constant int&, uint3, uint3, uint);
+#define instantiate_gdn_tape(type, tname, dk, dv, hk, hv)       \
+  template [[host_name(                                         \
+      "gated_delta_step_record_" #tname "_" #dk "_" #dv "_" #hk \
+      "_" #hv)]] [[kernel]] void                                \
+  gated_delta_step_record<type, dk, dv, hk, hv>(                \
+      const device type*,                                       \
+      const device type*,                                       \
+      const device type*,                                       \
+      const device type*,                                       \
+      const device type*,                                       \
+      const device type*,                                       \
+      const device bool*,                                       \
+      device type*,                                             \
+      device type*,                                             \
+      device type*,                                             \
+      constant int&,                                            \
+      uint3,                                                    \
+      uint3,                                                    \
+      uint);                                                    \
+  template [[host_name(                                         \
+      "state_replay_" #tname "_" #dk "_" #dv "_" #hk            \
+      "_" #hv)]] [[kernel]] void                                \
+  state_replay<type, dk, dv, hk, hv>(                           \
+      const device type*,                                       \
+      const device type*,                                       \
+      const device type*,                                       \
+      const device type*,                                       \
+      const device bool*,                                       \
+      device type*,                                             \
+      constant int&,                                            \
+      constant int&,                                            \
+      uint3,                                                    \
+      uint3,                                                    \
+      uint);
 
 // float32 instantiations are needed because `gatedDeltaUpdate` in
 // `MLXLLM/Models/GatedDelta.swift` forces state to fp32 for prefill/verify
@@ -259,58 +276,59 @@ template <typename T, int Dk, int Dv, int Hk, int Hv>
 // surface symmetric with `gated_delta.metal`.
 
 // Qwen 3.5 / 3.6 A3B: Dk=192, Dv=128, Hk=4, Hv=4
-instantiate_gdn_tape(half,        float16,  192, 128, 4, 4)
-instantiate_gdn_tape(bfloat16_t,  bfloat16, 192, 128, 4, 4)
-instantiate_gdn_tape(float,       float32,  192, 128, 4, 4)
+instantiate_gdn_tape(half, float16, 192, 128, 4, 4)
+    instantiate_gdn_tape(bfloat16_t, bfloat16, 192, 128, 4, 4)
+        instantiate_gdn_tape(float, float32, 192, 128, 4, 4)
 
-// Qwen 3.5 / 3.6 larger variants
-instantiate_gdn_tape(half,        float16,  128, 128, 8, 8)
-instantiate_gdn_tape(bfloat16_t,  bfloat16, 128, 128, 8, 8)
-instantiate_gdn_tape(float,       float32,  128, 128, 8, 8)
-instantiate_gdn_tape(half,        float16,  64,  64,  8, 8)
-instantiate_gdn_tape(bfloat16_t,  bfloat16, 64,  64,  8, 8)
-instantiate_gdn_tape(float,       float32,  64,  64,  8, 8)
+    // Qwen 3.5 / 3.6 larger variants
+    instantiate_gdn_tape(half, float16, 128, 128, 8, 8)
+        instantiate_gdn_tape(bfloat16_t, bfloat16, 128, 128, 8, 8)
+            instantiate_gdn_tape(float, float32, 128, 128, 8, 8)
+                instantiate_gdn_tape(half, float16, 64, 64, 8, 8)
+                    instantiate_gdn_tape(bfloat16_t, bfloat16, 64, 64, 8, 8)
+                        instantiate_gdn_tape(float, float32, 64, 64, 8, 8)
 
-// Qwen 3.5 / 3.6-35B: Dk=128, Dv=128, numHeads=16, numKVHeads=2 → Hk=16 Hv=32
-instantiate_gdn_tape(half,        float16,  128, 128, 16, 32)
-instantiate_gdn_tape(bfloat16_t,  bfloat16, 128, 128, 16, 32)
-instantiate_gdn_tape(float,       float32,  128, 128, 16, 32)
+    // Qwen 3.5 / 3.6-35B: Dk=128, Dv=128, numHeads=16, numKVHeads=2 → Hk=16
+    // Hv=32
+    instantiate_gdn_tape(half, float16, 128, 128, 16, 32)
+        instantiate_gdn_tape(bfloat16_t, bfloat16, 128, 128, 16, 32)
+            instantiate_gdn_tape(float, float32, 128, 128, 16, 32)
 
-// Qwen 3.5 / 3.6 dense models: Dk=128, Dv=128, Hk=16, Hv=16 (0.8B–9B)
-instantiate_gdn_tape(half,        float16,  128, 128, 16, 16)
-instantiate_gdn_tape(bfloat16_t,  bfloat16, 128, 128, 16, 16)
-instantiate_gdn_tape(float,       float32,  128, 128, 16, 16)
+    // Qwen 3.5 / 3.6 dense models: Dk=128, Dv=128, Hk=16, Hv=16 (0.8B–9B)
+    instantiate_gdn_tape(half, float16, 128, 128, 16, 16)
+        instantiate_gdn_tape(bfloat16_t, bfloat16, 128, 128, 16, 16)
+            instantiate_gdn_tape(float, float32, 128, 128, 16, 16)
 
-// Qwen 3.5 / 3.6 dense 27B: Hv=48
-instantiate_gdn_tape(half,        float16,  128, 128, 16, 48)
-instantiate_gdn_tape(bfloat16_t,  bfloat16, 128, 128, 16, 48)
-instantiate_gdn_tape(float,       float32,  128, 128, 16, 48)
+    // Qwen 3.5 / 3.6 dense 27B: Hv=48
+    instantiate_gdn_tape(half, float16, 128, 128, 16, 48)
+        instantiate_gdn_tape(bfloat16_t, bfloat16, 128, 128, 16, 48)
+            instantiate_gdn_tape(float, float32, 128, 128, 16, 48)
 
-// Small-cell coverage for unit tests (matches mlx-swift-lm's
-// `SSMStateCacheStateReplayTests` fixture: B=1, Hv=2, Hk=2, Dk=64, Dv=32).
-instantiate_gdn_tape(half,        float16,  64,  32,  2, 2)
-instantiate_gdn_tape(bfloat16_t,  bfloat16, 64,  32,  2, 2)
-instantiate_gdn_tape(float,       float32,  64,  32,  2, 2)
+    // Small-cell coverage for unit tests (matches mlx-swift-lm's
+    // `SSMStateCacheStateReplayTests` fixture: B=1, Hv=2, Hk=2, Dk=64, Dv=32).
+    instantiate_gdn_tape(half, float16, 64, 32, 2, 2)
+        instantiate_gdn_tape(bfloat16_t, bfloat16, 64, 32, 2, 2)
+            instantiate_gdn_tape(float, float32, 64, 32, 2, 2)
 
-// Hk == Hv variants needed by the **replay kernel** specifically. The
-// state-replay rollback consumes the cache's GQA-expanded k log, which
-// has Hk_effective = Hv (not the layer's original Hk). The dispatcher
-// in `MLXLMCommon/StateReplayKernels.swift::stateReplayUpdate` sets
-// `let Hk = Hv`, so we instantiate every (Dk, Dv, Hv, Hv) cell that
-// matches a real Qwen 3.5 / 3.6 variant.
-//
-// The forward kernel `gated_delta_step_record` still uses the layer's
-// original Hk, so the GQA-asymmetric cells above continue to apply on
-// the record path. Both surfaces share the same .metal source +
-// template — only the dispatcher decides which (Hk, Hv) tuple it asks
-// for, and both must be instantiated.
+    // Hk == Hv variants needed by the **replay kernel** specifically. The
+    // state-replay rollback consumes the cache's GQA-expanded k log, which
+    // has Hk_effective = Hv (not the layer's original Hk). The dispatcher
+    // in `MLXLMCommon/StateReplayKernels.swift::stateReplayUpdate` sets
+    // `let Hk = Hv`, so we instantiate every (Dk, Dv, Hv, Hv) cell that
+    // matches a real Qwen 3.5 / 3.6 variant.
+    //
+    // The forward kernel `gated_delta_step_record` still uses the layer's
+    // original Hk, so the GQA-asymmetric cells above continue to apply on
+    // the record path. Both surfaces share the same .metal source +
+    // template — only the dispatcher decides which (Hk, Hv) tuple it asks
+    // for, and both must be instantiated.
 
-// Qwen 3.5 / 3.6 35B: replay Hk=Hv=32 (forward uses Hk=16, Hv=32)
-instantiate_gdn_tape(half,        float16,  128, 128, 32, 32)
-instantiate_gdn_tape(bfloat16_t,  bfloat16, 128, 128, 32, 32)
-instantiate_gdn_tape(float,       float32,  128, 128, 32, 32)
+    // Qwen 3.5 / 3.6 35B: replay Hk=Hv=32 (forward uses Hk=16, Hv=32)
+    instantiate_gdn_tape(half, float16, 128, 128, 32, 32)
+        instantiate_gdn_tape(bfloat16_t, bfloat16, 128, 128, 32, 32)
+            instantiate_gdn_tape(float, float32, 128, 128, 32, 32)
 
-// Qwen 3.5 / 3.6 dense 27B: replay Hk=Hv=48 (forward uses Hk=16, Hv=48)
-instantiate_gdn_tape(half,        float16,  128, 128, 48, 48)
-instantiate_gdn_tape(bfloat16_t,  bfloat16, 128, 128, 48, 48)
-instantiate_gdn_tape(float,       float32,  128, 128, 48, 48)
+    // Qwen 3.5 / 3.6 dense 27B: replay Hk=Hv=48 (forward uses Hk=16, Hv=48)
+    instantiate_gdn_tape(half, float16, 128, 128, 48, 48)
+        instantiate_gdn_tape(bfloat16_t, bfloat16, 128, 128, 48, 48)
+            instantiate_gdn_tape(float, float32, 128, 128, 48, 48)

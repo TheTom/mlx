@@ -36,8 +36,7 @@ void GatedDeltaStepRecord::eval_gpu(
   // state_in into registers before the T-loop and writes state_out from
   // registers after it, so the two can alias the same buffer.
   const auto& state_in = inputs[5];
-  if (state_in.is_donatable() &&
-      state_in.flags().row_contiguous &&
+  if (state_in.is_donatable() && state_in.flags().row_contiguous &&
       state_in.size() == state_out.size()) {
     state_out.copy_shared_buffer(state_in);
   } else {
@@ -47,8 +46,8 @@ void GatedDeltaStepRecord::eval_gpu(
   // Build kernel name: gated_delta_step_record_<dtype>_<Dk>_<Dv>_<Hk>_<Hv>
   std::string tname = type_to_name(y.dtype());
   std::string kname = "gated_delta_step_record_" + tname + "_" +
-                      std::to_string(Dk_) + "_" + std::to_string(Dv_) + "_" +
-                      std::to_string(Hk_) + "_" + std::to_string(Hv_);
+      std::to_string(Dk_) + "_" + std::to_string(Dv_) + "_" +
+      std::to_string(Hk_) + "_" + std::to_string(Hv_);
 
   // Function constant for mask selection (matches index 10 in the .metal).
   std::string hash_name = kname + (has_mask_ ? "_mask" : "_nomask");
@@ -96,15 +95,14 @@ void GatedDeltaStepRecord::eval_gpu(
   // gated_delta_step.
   int B = static_cast<int>(state_out.shape(0));
   compute_encoder.dispatch_threadgroups(
-      MTL::Size(1, Dv_ / 4, B * Hv_),
-      MTL::Size(32, 4, 1));
+      MTL::Size(1, Dv_ / 4, B * Hv_), MTL::Size(32, 4, 1));
 }
 
 bool GatedDeltaStepRecord::is_equivalent(const Primitive& other) const {
   const GatedDeltaStepRecord& o =
       static_cast<const GatedDeltaStepRecord&>(other);
   return has_mask_ == o.has_mask_ && T_ == o.T_ && Dk_ == o.Dk_ &&
-         Dv_ == o.Dv_ && Hk_ == o.Hk_ && Hv_ == o.Hv_;
+      Dv_ == o.Dv_ && Hk_ == o.Hk_ && Hv_ == o.Hv_;
 }
 
 // ============================================================================
@@ -126,8 +124,7 @@ void TapeReplay::eval_gpu(
   // Donate state_in if eligible (same load-into-registers-then-write
   // pattern as `gated_delta_step` allows aliasing).
   const auto& state_in = inputs[3];
-  if (state_in.is_donatable() &&
-      state_in.flags().row_contiguous &&
+  if (state_in.is_donatable() && state_in.flags().row_contiguous &&
       state_in.size() == state_out.size()) {
     state_out.copy_shared_buffer(state_in);
   } else {
@@ -136,9 +133,9 @@ void TapeReplay::eval_gpu(
 
   // Build kernel name: state_replay_<dtype>_<Dk>_<Dv>_<Hk>_<Hv>
   std::string tname = type_to_name(state_out.dtype());
-  std::string kname = "state_replay_" + tname + "_" +
-                      std::to_string(Dk_) + "_" + std::to_string(Dv_) + "_" +
-                      std::to_string(Hk_) + "_" + std::to_string(Hv_);
+  std::string kname = "state_replay_" + tname + "_" + std::to_string(Dk_) +
+      "_" + std::to_string(Dv_) + "_" + std::to_string(Hk_) + "_" +
+      std::to_string(Hv_);
 
   // Function constant for mask selection (matches index 20 in the .metal).
   std::string hash_name = kname + (has_mask_ ? "_mask" : "_nomask");
@@ -180,15 +177,14 @@ void TapeReplay::eval_gpu(
   // Grid: (32, Dv, B * Hv)  ThreadGroup: (32, 4, 1)
   int B = static_cast<int>(state_out.shape(0));
   compute_encoder.dispatch_threadgroups(
-      MTL::Size(1, Dv_ / 4, B * Hv_),
-      MTL::Size(32, 4, 1));
+      MTL::Size(1, Dv_ / 4, B * Hv_), MTL::Size(32, 4, 1));
 }
 
 bool TapeReplay::is_equivalent(const Primitive& other) const {
   const TapeReplay& o = static_cast<const TapeReplay&>(other);
   return has_mask_ == o.has_mask_ && T_log_ == o.T_log_ &&
-         accepted_ == o.accepted_ && Dk_ == o.Dk_ && Dv_ == o.Dv_ &&
-         Hk_ == o.Hk_ && Hv_ == o.Hv_;
+      accepted_ == o.accepted_ && Dk_ == o.Dk_ && Dv_ == o.Dv_ &&
+      Hk_ == o.Hk_ && Hv_ == o.Hv_;
 }
 
 } // namespace mlx::core::fast
