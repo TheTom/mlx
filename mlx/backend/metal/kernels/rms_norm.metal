@@ -64,16 +64,23 @@ template <typename T, int N_READS = RMS_N_READS>
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Write the outputs
+  // Write the outputs.
+  // Output multiply done in fp32 to dodge the bf16*bf16 overflow path that
+  // produces NaN at hidden ≥ 4096 on Apple Metal. Downcast to T only at the
+  // store (see rms_looped below for the matching fix).
   out += gid * size_t(axis_size) + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
     for (int i = 0; i < N_READS; i++) {
-      out[i] = w[w_stride * i] * static_cast<T>(x[i] * local_inv_mean[0]);
+      float wi = static_cast<float>(w[w_stride * i]);
+      float xi = static_cast<float>(x[i]);
+      out[i] = static_cast<T>(wi * xi * local_inv_mean[0]);
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
-        out[i] = w[w_stride * i] * static_cast<T>(x[i] * local_inv_mean[0]);
+        float wi = static_cast<float>(w[w_stride * i]);
+        float xi = static_cast<float>(x[i]);
+        out[i] = static_cast<T>(wi * xi * local_inv_mean[0]);
       }
     }
   }
@@ -136,19 +143,25 @@ template <typename T, int N_READS = RMS_N_READS>
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Write the outputs
+  // Write the outputs.
+  // Output multiply done in fp32 to dodge the bf16*bf16 overflow path. The
+  // looped kernel runs when axis_size > RMS_LOOPED_LIMIT (4096) — matches
+  // Qwen3.5-27B-BF16 hidden=5120. NaN propagation from this site collapses
+  // decode to argmax=0 (token "!"). See rms_single_row above for matching fix.
   out += gid * size_t(axis_size) + lid * N_READS;
   for (uint r = 0; r < axis_size; r += lsize * N_READS) {
     if (r + lid * N_READS + N_READS <= axis_size) {
       for (int i = 0; i < N_READS; i++) {
-        out[r + i] = w[w_stride * (i + r)] *
-            static_cast<T>(x[r + i] * local_inv_mean[0]);
+        float wi = static_cast<float>(w[w_stride * (i + r)]);
+        float xi = static_cast<float>(x[r + i]);
+        out[r + i] = static_cast<T>(wi * xi * local_inv_mean[0]);
       }
     } else {
       for (int i = 0; i < N_READS; i++) {
         if ((r + lid * N_READS + i) < axis_size) {
-          out[r + i] = w[w_stride * (i + r)] *
-              static_cast<T>(x[r + i] * local_inv_mean[0]);
+          float wi = static_cast<float>(w[w_stride * (i + r)]);
+          float xi = static_cast<float>(x[r + i]);
+          out[r + i] = static_cast<T>(wi * xi * local_inv_mean[0]);
         }
       }
     }

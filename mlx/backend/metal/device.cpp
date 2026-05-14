@@ -1015,6 +1015,14 @@ bool is_nax_available() {
 #ifdef MLX_METAL_NO_NAX
   return false;
 #else
+  // Runtime override: MLX_METAL_NO_NAX=1 disables NAX dispatch even when the
+  // device supports it. Works around bf16 matmul NaN at large hidden dims
+  // (Qwen3.5-27B-BF16 etc.) until the upstream NAX bf16 path is patched.
+  static const bool _runtime_disable_nax = []() {
+    const char* env = std::getenv("MLX_METAL_NO_NAX");
+    return env != nullptr && env[0] == '1' && env[1] == '\0';
+  }();
+  if (_runtime_disable_nax) return false;
   auto _check_nax = []() {
     bool can_use_nax = false;
     if (__builtin_available(
