@@ -1104,4 +1104,183 @@ class SSMStep : public Custom {
   int G_;
 };
 
+// Spec 041 Phase 1.1: fused flash-quantized SDPA — affine-quantized K and V
+// are dequantised inline inside a tiled online-softmax loop. Same shape and
+// semantics as MLXFast's `scaled_dot_product_attention`; replaces the
+// discrete `quantizedMM → softmax → quantizedMM` triple at affine call sites.
+//
+// Inputs (in order):
+//   queries  — [B, n_q_heads, T_q, D]
+//   k_packed — [B, n_kv_heads, T_kv, D / (32/bits)]      uint32
+//   k_scales — [B, n_kv_heads, T_kv, D / group_size]     T
+//   k_biases — [B, n_kv_heads, T_kv, D / group_size]     T
+//   v_packed — [B, n_kv_heads, T_kv, V / (32/bits)]      uint32
+//   v_scales / v_biases — same shape rule as K.
+//   mask     — optional bool / float mask [..., T_q, T_kv].
+//   sinks    — optional [n_q_heads] per-Q-head sink logits.
+//
+// Output: [B, n_q_heads, T_q, V] in queries' dtype.
+class FlashQuantizedSDPA : public Custom {
+ public:
+  FlashQuantizedSDPA(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      float scale,
+      bool do_causal,
+      bool has_sinks,
+      int bits,
+      int group_size,
+      int n_q_heads,
+      int n_kv_heads)
+      : Custom(stream, std::move(fallback)),
+        scale_(scale),
+        do_causal_(do_causal),
+        has_sinks_(has_sinks),
+        bits_(bits),
+        group_size_(group_size),
+        n_q_heads_(n_q_heads),
+        n_kv_heads_(n_kv_heads) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("FlashQuantizedSDPA only runs on GPU");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(FlashQuantizedSDPA)
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+  auto state() const {
+    return std::make_tuple(
+        nullptr,
+        scale_,
+        do_causal_,
+        has_sinks_,
+        bits_,
+        group_size_,
+        n_q_heads_,
+        n_kv_heads_);
+  }
+
+ private:
+  float scale_;
+  bool do_causal_;
+  bool has_sinks_;
+  int bits_;
+  int group_size_;
+  int n_q_heads_;
+  int n_kv_heads_;
+};
+
+// Spec 040: Mamba / Mamba 2 selective-SSM step + delta-log capture for
+// state-replay rollback. Sequential per-step recurrence — written this way
+// (instead of leveraging ssmAttn's parallel scan) so we can materialise the
+// per-step `(dA_t, dBx_t)` pair into a delta log that `SSMReplay` re-folds
+// during n-gram speculative rollback.
+//
+// Inputs:
+//   x         — [B, T, H, dh]      hidden state input
+//   ALog      — [H]                state-decay log
+//   B         — [B, T, G, ds]      per-step input gate (G ≤ H, GQA-expanded)
+//   C         — [B, T, G, ds]      per-step output gate
+//   D         — [H]                skip
+//   dt        — [B, T, H]          per-step time-step
+//   state_in  — [B, H, dh, ds]     recurrent state at t=0
+//   mask?     — [B, T] (optional, branchless-masked timesteps zero dA/dBx)
+//
+// Outputs:
+//   y         — [B, T, H, dh]
+//   state_out — [B, H, dh, ds]
+//   dA_log    — [B, T, H, ds]      per-step decay (for SSMReplay)
+//   dBx_log   — [B, T, H, dh, ds]  per-step innovation (for SSMReplay)
+class SSMStepRecord : public Custom {
+ public:
+  SSMStepRecord(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int Dh,
+      int Ds,
+      int H,
+      int G,
+      bool has_mask)
+      : Custom(stream, std::move(fallback)),
+        Dh_(Dh),
+        Ds_(Ds),
+        H_(H),
+        G_(G),
+        has_mask_(has_mask) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("SSMStepRecord only runs on GPU");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(SSMStepRecord)
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+  auto state() const {
+    return std::make_tuple(nullptr, Dh_, Ds_, H_, G_, has_mask_);
+  }
+
+ private:
+  int Dh_;
+  int Ds_;
+  int H_;
+  int G_;
+  bool has_mask_;
+};
+
+// Rollback step for Mamba state replay. Re-folds the first `k` entries of
+// the delta log produced by `SSMStepRecord` onto a recurrent-state snapshot.
+//
+// Inputs:
+//   state_snapshot — [B, H, dh, ds]   pre-record recurrent state
+//   dA_log         — [B, T, H, ds]
+//   dBx_log        — [B, T, H, dh, ds]
+//   mask?          — [B, T] (optional — masked steps skip replay)
+//
+// Output:
+//   state_after_k  — [B, H, dh, ds]  state after folding entries [0, k).
+class SSMReplay : public Custom {
+ public:
+  SSMReplay(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int Dh,
+      int Ds,
+      int H,
+      int accepted_prefix,
+      bool has_mask)
+      : Custom(stream, std::move(fallback)),
+        Dh_(Dh),
+        Ds_(Ds),
+        H_(H),
+        accepted_prefix_(accepted_prefix),
+        has_mask_(has_mask) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error("SSMReplay only runs on GPU");
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(SSMReplay)
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+  auto state() const {
+    return std::make_tuple(nullptr, Dh_, Ds_, H_, accepted_prefix_, has_mask_);
+  }
+
+ private:
+  int Dh_;
+  int Ds_;
+  int H_;
+  int accepted_prefix_;
+  bool has_mask_;
+};
+
 } // namespace mlx::core::fast

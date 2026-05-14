@@ -133,6 +133,8 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/softmax.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/sort.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/ssm.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/ssm_replay.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/flash_quantized_sdpa.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/reduce.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/ternary.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/turbo_quant.cpp

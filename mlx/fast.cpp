@@ -2090,4 +2090,179 @@ std::vector<array> ssm_step(
   return outputs;
 }
 
+// ============================================================================
+// Spec 041 phase 1.1: flash quantized SDPA
+// ============================================================================
+array flash_quantized_sdpa(
+    const array& queries,
+    const array& k_packed,
+    const array& k_scales,
+    const array& k_biases,
+    const array& v_packed,
+    const array& v_scales,
+    const array& v_biases,
+    const float scale,
+    int bits,
+    int group_size,
+    const std::string& mask_mode /* = "" */,
+    std::optional<array> mask_arr /* = {} */,
+    const std::optional<array>& sinks /* = {} */,
+    StreamOrDevice s_ /* = {} */) {
+  auto s = to_stream(s_);
+
+  if (queries.ndim() != 4) {
+    throw std::invalid_argument(
+        "[flash_quantized_sdpa] queries must be rank 4 [B, n_q, T_q, D]");
+  }
+  bool do_causal = (mask_mode == "causal");
+  bool has_arr_mask = mask_arr.has_value() && !do_causal;
+  if (!mask_mode.empty() && mask_mode != "causal" && mask_mode != "array") {
+    throw std::invalid_argument(
+        "[flash_quantized_sdpa] mask_mode must be 'causal', 'array', or ''");
+  }
+
+  int B = queries.shape(0);
+  int n_q_heads = queries.shape(1);
+  int T_q = queries.shape(2);
+  int D = queries.shape(3);
+  int n_kv_heads = k_packed.shape(1);
+  int T_kv = k_packed.shape(2);
+  int V = v_scales.shape(-1) * group_size;
+  if (V == 0)
+    V = D;
+
+  Shape out_shape = {B, n_q_heads, T_q, V};
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[flash_quantized_sdpa] Only runs on GPU");
+  };
+
+  std::vector<array> inputs = {
+      queries,
+      k_packed,
+      astype(k_scales, queries.dtype(), s),
+      astype(k_biases, queries.dtype(), s),
+      v_packed,
+      astype(v_scales, queries.dtype(), s),
+      astype(v_biases, queries.dtype(), s)};
+
+  if (has_arr_mask) {
+    inputs.push_back(*mask_arr);
+  }
+  bool has_sinks = sinks.has_value();
+  if (has_sinks) {
+    inputs.push_back(astype(*sinks, queries.dtype(), s));
+  }
+
+  return array(
+      std::move(out_shape),
+      queries.dtype(),
+      std::make_shared<FlashQuantizedSDPA>(
+          s,
+          fallback,
+          scale,
+          do_causal,
+          has_sinks,
+          bits,
+          group_size,
+          n_q_heads,
+          n_kv_heads),
+      std::move(inputs));
+}
+
+// ============================================================================
+// Spec 040: Mamba state replay
+// ============================================================================
+std::vector<array> ssm_step_record(
+    const array& x,
+    const array& A_log,
+    const array& B,
+    const array& C,
+    const array& D,
+    const array& dt,
+    const array& state,
+    const std::optional<array>& mask /* = {} */,
+    StreamOrDevice s_ /* = {} */) {
+  auto s = to_stream(s_);
+  auto out_type = x.dtype();
+
+  int B_dim = x.shape(0);
+  int T = x.shape(1);
+  int H = x.shape(2);
+  int dh = x.shape(3);
+  int G = B.shape(2);
+  int ds = B.shape(3);
+
+  Shape y_shape = {B_dim, T, H, dh};
+  Shape state_shape = state.shape();
+  Shape dA_log_shape = {B_dim, T, H, ds};
+  Shape dBx_log_shape = {B_dim, T, H, dh, ds};
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[ssm_step_record] Only runs on GPU");
+  };
+
+  std::vector<array> inputs = {
+      astype(x, out_type, s),
+      astype(A_log, out_type, s),
+      astype(B, out_type, s),
+      astype(C, out_type, s),
+      astype(D, out_type, s),
+      astype(dt, out_type, s),
+      astype(state, out_type, s)};
+  bool has_mask = mask.has_value();
+  if (has_mask) {
+    inputs.push_back(astype(*mask, out_type, s));
+  }
+
+  auto outputs = array::make_arrays(
+      {std::move(y_shape),
+       std::move(state_shape),
+       std::move(dA_log_shape),
+       std::move(dBx_log_shape)},
+      {out_type, out_type, out_type, out_type},
+      std::make_shared<SSMStepRecord>(s, fallback, dh, ds, H, G, has_mask),
+      std::move(inputs));
+  async_eval(outputs);
+  return outputs;
+}
+
+array ssm_replay(
+    const array& state_snapshot,
+    const array& dA_log,
+    const array& dBx_log,
+    int accepted_prefix,
+    const std::optional<array>& mask /* = {} */,
+    StreamOrDevice s_ /* = {} */) {
+  auto s = to_stream(s_);
+  auto out_type = state_snapshot.dtype();
+
+  int B_dim = state_snapshot.shape(0);
+  int H = state_snapshot.shape(1);
+  int dh = state_snapshot.shape(2);
+  int ds = state_snapshot.shape(3);
+
+  Shape out_shape = {B_dim, H, dh, ds};
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[ssm_replay] Only runs on GPU");
+  };
+
+  std::vector<array> inputs = {
+      astype(state_snapshot, out_type, s),
+      astype(dA_log, out_type, s),
+      astype(dBx_log, out_type, s)};
+  bool has_mask = mask.has_value();
+  if (has_mask) {
+    inputs.push_back(astype(*mask, out_type, s));
+  }
+
+  return array(
+      std::move(out_shape),
+      out_type,
+      std::make_shared<SSMReplay>(
+          s, fallback, dh, ds, H, accepted_prefix, has_mask),
+      std::move(inputs));
+}
+
 } // namespace mlx::core::fast

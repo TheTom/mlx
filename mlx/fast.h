@@ -440,4 +440,63 @@ MLX_API std::vector<array> ssm_step(
     int G,
     StreamOrDevice s = {});
 
+/// Flash quantized SDPA — spec 041 phase 1.1.
+///
+/// Mirrors `scaled_dot_product_attention` but consumes affine-quantized K and
+/// V (each as a triple `(packed_indices, scales, biases)`) and dequantises
+/// inline inside the tiled online-softmax loop. Output shape and semantics
+/// match the unquantized path.
+///
+/// `mask_mode` accepts `""`, `"causal"`. Array masks pass through `mask_arr`.
+/// `sinks` is an optional `[n_q_heads]` tensor of per-head sink logits folded
+/// into the softmax denominator.
+MLX_API array flash_quantized_sdpa(
+    const array& queries,
+    const array& k_packed,
+    const array& k_scales,
+    const array& k_biases,
+    const array& v_packed,
+    const array& v_scales,
+    const array& v_biases,
+    const float scale,
+    int bits,
+    int group_size,
+    const std::string& mask_mode = "",
+    std::optional<array> mask_arr = {},
+    const std::optional<array>& sinks = {},
+    StreamOrDevice s = {});
+
+/// Mamba state-replay primitive — sequential SSM step with per-step delta-log
+/// capture. Drop-in replacement for the L>1 forward path during a recording
+/// session; emits a per-step `(dA, dBx)` log alongside the standard
+/// `(y, state_out)` outputs.
+///
+/// Returns `{y, state_out, dA_log, dBx_log}`:
+///   - y         [B, T, H, dh]
+///   - state_out [B, H, dh, ds]
+///   - dA_log    [B, T, H, ds]
+///   - dBx_log   [B, T, H, dh, ds]
+MLX_API std::vector<array> ssm_step_record(
+    const array& x,
+    const array& A_log,
+    const array& B,
+    const array& C,
+    const array& D,
+    const array& dt,
+    const array& state,
+    const std::optional<array>& mask = {},
+    StreamOrDevice s = {});
+
+/// Replay the first `accepted_prefix` entries of a delta log produced by
+/// `ssm_step_record` onto a state snapshot, returning the post-replay state.
+///
+/// Output: [B, H, dh, ds]
+MLX_API array ssm_replay(
+    const array& state_snapshot,
+    const array& dA_log,
+    const array& dBx_log,
+    int accepted_prefix,
+    const std::optional<array>& mask = {},
+    StreamOrDevice s = {});
+
 } // namespace mlx::core::fast
