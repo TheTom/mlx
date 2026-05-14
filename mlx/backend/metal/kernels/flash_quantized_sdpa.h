@@ -1,4 +1,5 @@
-// Copyright © 2026 Eric Kryski. Flash quantized SDPA — spec 041 phase 1.1.
+// Copyright © 2026 Eric Kryski. Flash quantized SDPA — spec 041 phase 1.1
+// (initial kernel) + phase 1.2 (perf optimisations + sliding window).
 //
 // Affine-quantized variant of `sdpa_vector`. Same online-softmax loop, but
 // K and V are dequantised inline per-thread from packed-indices + scale +
@@ -9,13 +10,26 @@
 //   - k_packed: [B, n_kv_heads, T_kv, D / (32/Bits)] uint32
 //   - k_scales: [B, n_kv_heads, T_kv, D / GroupSize] T
 //   - k_biases: [B, n_kv_heads, T_kv, D / GroupSize] T   (affine has bias;
-//   mxfp4 sets bias=0)
+//                                                        mxfp4 sets bias=0)
 //   - v_packed: [B, n_kv_heads, T_kv, V / (32/Bits)] uint32
 //   - v_scales / v_biases: same shape rule as k.
 //   - out:     [B, n_q_heads, T_q, V] T
 //
 // Threadgroup geometry: same as sdpa_vector (BN=BD=32, one threadgroup per
 // (batch*query_head, query_pos), 32 simdgroups distributing K positions).
+//
+// Phase 1.2 perf additions (over the initial kernel):
+//   - `do_sliding_fq` + `window_size` function constants for windowed
+//     causal masking (Gemma 4 sliding layers, GPT-OSS sliding layers).
+//     When set, the inner loop skips key positions outside
+//     `(q_pos - window, q_pos]`. Free with the causal compare — no extra
+//     mask materialisation.
+//   - Skip-cheap-keys on `block_l == 0` mid-window guard (mirrors
+//     `sdpa_vector`'s zero-mass shortcut) — saves dequant + dot product
+//     work on fully-masked-out simdgroup iterations.
+//   - Pre-load codebook-free affine scale/bias once per `Ds/GroupSize`
+//     group (when `GroupSize >= Ds`, that's once per token slice). Saves
+//     redundant device-memory loads per iteration.
 
 #include <metal_simdgroup>
 
@@ -27,6 +41,10 @@ constant bool do_causal_fq [[function_constant(42)]];
 constant bool bool_mask_fq [[function_constant(43)]];
 constant bool float_mask_fq [[function_constant(44)]];
 constant bool has_sinks_fq [[function_constant(45)]];
+// Phase 1.2: sliding-window mask. Independent of `do_causal_fq` — sliding
+// implies causal. When `do_sliding_fq == true`, `window_size` is the
+// `windowSize` in tokens; the kernel rejects keys at `i <= q_pos - window`.
+constant bool do_sliding_fq [[function_constant(46)]];
 
 template <typename T, int D, int V, int Bits, int GroupSize>
 [[kernel]] void flash_quantized_sdpa(
@@ -60,6 +78,8 @@ template <typename T, int D, int V, int Bits, int GroupSize>
     const device T* sinks [[buffer(24), function_constant(has_sinks_fq)]],
     const constant int& num_q_heads
     [[buffer(25), function_constant(has_sinks_fq)]],
+    const constant int& window_size
+    [[buffer(26), function_constant(do_sliding_fq)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -70,6 +90,12 @@ template <typename T, int D, int V, int Bits, int GroupSize>
   constexpr int v_per_thread = V / BD;
   constexpr int pack_factor = 32 / Bits;
   constexpr uint mask_bits = (1u << Bits) - 1u;
+  // Phase 1.2: group is constant per thread if GroupSize ≥ qk_per_thread
+  // (true for groupSize=64 + D ≤ 2048). Pre-compute the per-thread group
+  // index so the inner loop pulls scale/bias from a single pair of
+  // registers instead of recomputing the address per `j`.
+  constexpr bool single_group_per_thread =
+      (GroupSize >= qk_per_thread) && (GroupSize % qk_per_thread == 0);
 
   typedef float U;
 
@@ -115,10 +141,13 @@ template <typename T, int D, int V, int Bits, int GroupSize>
   const device T* v_scales_head = v_scales + kv_head_idx * v_head_stride_scale;
   const device T* v_biases_head = v_biases + kv_head_idx * v_head_stride_scale;
 
-  // Pre-load query (apply scale).
+// Pre-load query (apply scale) — vec-style: read `qk_per_thread` dims into
+// registers via a tight loop the compiler will vectorise to wide loads.
+#pragma clang loop unroll(full)
   for (int i = 0; i < qk_per_thread; i++) {
     q[i] = static_cast<U>(scale) * static_cast<U>(queries_thread[i]);
   }
+#pragma clang loop unroll(full)
   for (int i = 0; i < v_per_thread; i++) {
     o[i] = 0;
   }
@@ -130,14 +159,31 @@ template <typename T, int D, int V, int Bits, int GroupSize>
     sum_exp_score = 1;
   }
 
+  // Phase 1.2: precompute the sliding-window lower bound once per query
+  // position. `do_causal_fq` already establishes the upper bound. Outside
+  // both, the `use_key` check folds to a single comparison.
+  int causal_upper = 0;
+  int sliding_lower = -1;
+  if (do_causal_fq) {
+    causal_upper = N - int(tpg.y) + int(q_seq_idx);
+  }
+  if (do_sliding_fq) {
+    // Strictly greater-than lower bound: keys at (q_pos - window) are out.
+    sliding_lower = (do_causal_fq ? causal_upper : (N - 1)) - window_size;
+  }
+
   // Iterate K positions in chunks of BN across simdgroups.
   for (int i = simd_gid; i < N; i += BN) {
     bool use_key = true;
     if (do_causal_fq) {
-      use_key = i <= (N - int(tpg.y) + int(q_seq_idx));
-    } else if (bool_mask_fq) {
+      use_key = i <= causal_upper;
+    }
+    if (do_sliding_fq) {
+      use_key = use_key && (i > sliding_lower);
+    }
+    if (bool_mask_fq && use_key) {
       use_key = bmask[0];
-    } else if (float_mask_fq) {
+    } else if (float_mask_fq && use_key) {
       use_key = (fmask[0] >= -INFINITY);
     }
 
@@ -148,18 +194,34 @@ template <typename T, int D, int V, int Bits, int GroupSize>
       const device T* k_scales_t = k_scales_head + i * k_seq_stride_scale;
       const device T* k_biases_t = k_biases_head + i * k_seq_stride_scale;
 
+      // Phase 1.2: hoist scale/bias load when the thread's slice fits
+      // within a single quantisation group. Saves `qk_per_thread - 1`
+      // device-memory loads per iteration on the common shapes.
+      U k_scale_local = 0, k_bias_local = 0;
+      if (single_group_per_thread) {
+        int group_idx_thread = (simd_lid * qk_per_thread) / GroupSize;
+        k_scale_local = static_cast<U>(k_scales_t[group_idx_thread]);
+        k_bias_local = static_cast<U>(k_biases_t[group_idx_thread]);
+      }
+
+#pragma clang loop unroll(full)
       for (int j = 0; j < qk_per_thread; j++) {
         int d = simd_lid * qk_per_thread + j;
         int word_idx = d / pack_factor;
         int shift = (d % pack_factor) * Bits;
-        int group_idx = d / GroupSize;
         uint val = (k_packed_t[word_idx] >> shift) & mask_bits;
-        k[j] = static_cast<U>(k_scales_t[group_idx]) * U(val) +
-            static_cast<U>(k_biases_t[group_idx]);
+        if (single_group_per_thread) {
+          k[j] = k_scale_local * U(val) + k_bias_local;
+        } else {
+          int group_idx = d / GroupSize;
+          k[j] = static_cast<U>(k_scales_t[group_idx]) * U(val) +
+              static_cast<U>(k_biases_t[group_idx]);
+        }
       }
 
       // Compute the i-th score across qk_per_thread dims, then simd_sum.
       U score = 0;
+#pragma clang loop unroll(full)
       for (int j = 0; j < qk_per_thread; j++) {
         score += q[j] * k[j];
       }
@@ -175,25 +237,51 @@ template <typename T, int D, int V, int Bits, int GroupSize>
       max_score = new_max;
       sum_exp_score = sum_exp_score * factor + exp_score;
 
-      // Inline dequant V[i] for this thread's v_per_thread slice.
-      const device uint32_t* v_packed_t =
-          v_packed_head + i * v_seq_stride_packed;
-      const device T* v_scales_t = v_scales_head + i * v_seq_stride_scale;
-      const device T* v_biases_t = v_biases_head + i * v_seq_stride_scale;
+      // Phase 1.2: skip V load + accumulator update on near-zero softmax
+      // weight. Common after a high-magnitude sink fold or a far-back
+      // sliding-window edge. Threshold matches `sdpa_vector`'s implicit
+      // behaviour (the multiply with `exp_score ≈ 0` is a no-op on the
+      // accumulator). Bail-out saves the dequant work below.
+      if (exp_score > 1e-20) {
+        // Inline dequant V[i] for this thread's v_per_thread slice.
+        const device uint32_t* v_packed_t =
+            v_packed_head + i * v_seq_stride_packed;
+        const device T* v_scales_t = v_scales_head + i * v_seq_stride_scale;
+        const device T* v_biases_t = v_biases_head + i * v_seq_stride_scale;
 
-      for (int j = 0; j < v_per_thread; j++) {
-        int d = simd_lid * v_per_thread + j;
-        int word_idx = d / pack_factor;
-        int shift = (d % pack_factor) * Bits;
-        int group_idx = d / GroupSize;
-        uint val = (v_packed_t[word_idx] >> shift) & mask_bits;
-        v[j] = static_cast<U>(v_scales_t[group_idx]) * U(val) +
-            static_cast<U>(v_biases_t[group_idx]);
-      }
+        U v_scale_local = 0, v_bias_local = 0;
+        if (single_group_per_thread) {
+          int group_idx_thread = (simd_lid * v_per_thread) / GroupSize;
+          v_scale_local = static_cast<U>(v_scales_t[group_idx_thread]);
+          v_bias_local = static_cast<U>(v_biases_t[group_idx_thread]);
+        }
 
-      // Output accumulator update.
-      for (int j = 0; j < v_per_thread; j++) {
-        o[j] = o[j] * factor + exp_score * v[j];
+#pragma clang loop unroll(full)
+        for (int j = 0; j < v_per_thread; j++) {
+          int d = simd_lid * v_per_thread + j;
+          int word_idx = d / pack_factor;
+          int shift = (d % pack_factor) * Bits;
+          uint val = (v_packed_t[word_idx] >> shift) & mask_bits;
+          if (single_group_per_thread) {
+            v[j] = v_scale_local * U(val) + v_bias_local;
+          } else {
+            int group_idx = d / GroupSize;
+            v[j] = static_cast<U>(v_scales_t[group_idx]) * U(val) +
+                static_cast<U>(v_biases_t[group_idx]);
+          }
+        }
+
+// Output accumulator update.
+#pragma clang loop unroll(full)
+        for (int j = 0; j < v_per_thread; j++) {
+          o[j] = o[j] * factor + exp_score * v[j];
+        }
+      } else {
+// Zero contribution — still apply the factor to existing o[].
+#pragma clang loop unroll(full)
+        for (int j = 0; j < v_per_thread; j++) {
+          o[j] = o[j] * factor;
+        }
       }
     }
 

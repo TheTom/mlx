@@ -72,13 +72,17 @@ void FlashQuantizedSDPA::eval_gpu(
   size_t v_head_stride_scale = static_cast<size_t>(N) * v_scale_per_token;
   size_t v_seq_stride_scale = v_scale_per_token;
 
-  // Function constants — match kernel-side IDs (40-45).
+  // Function constants — match kernel-side IDs (40-46).
   bool has_mask_b = has_array_mask;
   bool query_transposed_b = !q.flags().row_contiguous;
   bool do_causal_b = do_causal_;
   bool bool_mask_b = has_array_mask && mask_arr->dtype() == bool_;
   bool float_mask_b = has_array_mask && !bool_mask_b;
   bool has_sinks_b = has_sinks_;
+  // Phase 1.2: sliding-window mask. `do_sliding == true` implies the
+  // kernel rejects keys at `i <= q_pos - window_size` in addition to the
+  // causal upper bound.
+  bool do_sliding_b = window_size_ > 0;
 
   metal::MTLFCList func_consts = {
       {&has_mask_b, MTL::DataType::DataTypeBool, 40},
@@ -87,6 +91,7 @@ void FlashQuantizedSDPA::eval_gpu(
       {&bool_mask_b, MTL::DataType::DataTypeBool, 43},
       {&float_mask_b, MTL::DataType::DataTypeBool, 44},
       {&has_sinks_b, MTL::DataType::DataTypeBool, 45},
+      {&do_sliding_b, MTL::DataType::DataTypeBool, 46},
   };
 
   // Kernel name: flash_quantized_sdpa_{type}_{D}_{V}_{bits}_{group_size}.
@@ -100,7 +105,8 @@ void FlashQuantizedSDPA::eval_gpu(
       (has_array_mask ? (bool_mask_b ? "_boolmask" : "_floatmask")
                       : "_nomask") +
       (query_transposed_b ? "_qt" : "_qnt") + (do_causal_b ? "_c" : "_nc") +
-      (has_sinks_b ? "_sinks" : "_nosinks");
+      (has_sinks_b ? "_sinks" : "_nosinks") +
+      (do_sliding_b ? "_sliding" : "_nosliding");
 
   auto& compute_encoder = metal::get_command_encoder(s);
   auto kernel = d.get_kernel(kname, hash_name, func_consts);
@@ -144,6 +150,9 @@ void FlashQuantizedSDPA::eval_gpu(
     compute_encoder.set_input_array(*sinks_arr, 24);
     compute_encoder.set_bytes(n_q_heads_, 25);
   }
+  if (do_sliding_b) {
+    compute_encoder.set_bytes(window_size_, 26);
+  }
 
   // Grid: (B * n_q_heads, T_q, 1). Threadgroup: (1024, 1, 1) = 32 simdgroups.
   MTL::Size group_dims(1024, 1, 1);
@@ -156,7 +165,7 @@ bool FlashQuantizedSDPA::is_equivalent(const Primitive& other) const {
   return scale_ == o.scale_ && do_causal_ == o.do_causal_ &&
       has_sinks_ == o.has_sinks_ && bits_ == o.bits_ &&
       group_size_ == o.group_size_ && n_q_heads_ == o.n_q_heads_ &&
-      n_kv_heads_ == o.n_kv_heads_;
+      n_kv_heads_ == o.n_kv_heads_ && window_size_ == o.window_size_;
 }
 
 std::vector<Shape> FlashQuantizedSDPA::output_shapes(

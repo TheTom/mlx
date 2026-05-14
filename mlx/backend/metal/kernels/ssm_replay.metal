@@ -242,82 +242,28 @@ template <typename T, int Dh, int Ds, int H>
       uint3,                                                         \
       uint3);
 
-// Nemotron + family: Dh=64, Ds=64; common H=16/32/48, G=1/2/4/8.
-#define instantiate_ssm_record_dh64_ds64_for(type, tname)                      \
-  instantiate_ssm_step_record(                                                 \
-      type,                                                                    \
-      tname,                                                                   \
-      64,                                                                      \
-      64,                                                                      \
-      16,                                                                      \
-      1) instantiate_ssm_step_record(type, tname, 64, 64, 16, 2)               \
-      instantiate_ssm_step_record(type, tname, 64, 64, 16, 4)                  \
-          instantiate_ssm_step_record(type, tname, 64, 64, 16, 8)              \
-              instantiate_ssm_step_record(type, tname, 64, 64, 32, 1)          \
-                  instantiate_ssm_step_record(type, tname, 64, 64, 32, 2)      \
-                      instantiate_ssm_step_record(type, tname, 64, 64, 32, 4)  \
-                          instantiate_ssm_step_record(                         \
-                              type, tname, 64, 64, 32, 8)                      \
-                              instantiate_ssm_step_record(                     \
-                                  type, tname, 64, 64, 48, 1)                  \
-                                  instantiate_ssm_step_record(                 \
-                                      type, tname, 64, 64, 48, 2)              \
-                                      instantiate_ssm_step_record(             \
-                                          type, tname, 64, 64, 48, 4)          \
-                                          instantiate_ssm_step_record(         \
-                                              type, tname, 64, 64, 48, 8)      \
-                                              instantiate_ssm_replay(          \
-                                                  type, tname, 64, 64, 16)     \
-                                                  instantiate_ssm_replay(      \
-                                                      type, tname, 64, 64, 32) \
-                                                      instantiate_ssm_replay(  \
-                                                          type,                \
-                                                          tname,               \
-                                                          64,                  \
-                                                          64,                  \
-                                                          48)
+// clang-format off
+// Coverage matches `ssm.metal` (Dh∈{64,128}, Ds∈{64,128}). H∈{16,32,48,64}
+// covers Nemotron-Cascade-2 (H=64), Jamba (H=32/48), and smaller Mamba 2.
+// G∈{1,2,4,8} covers GQA expansion ratios.
+#define instantiate_ssm_record_H_grid(type, tname, dh, ds, h) \
+  instantiate_ssm_step_record(type, tname, dh, ds, h, 1)      \
+  instantiate_ssm_step_record(type, tname, dh, ds, h, 2)      \
+  instantiate_ssm_step_record(type, tname, dh, ds, h, 4)      \
+  instantiate_ssm_step_record(type, tname, dh, ds, h, 8)      \
+  instantiate_ssm_replay(type, tname, dh, ds, h)
 
-// Mamba 2 wider state: Dh=128, Ds=128.
-#define instantiate_ssm_record_dh128_ds128_for(type, tname)                   \
-  instantiate_ssm_step_record(                                                \
-      type,                                                                   \
-      tname,                                                                  \
-      128,                                                                    \
-      128,                                                                    \
-      16,                                                                     \
-      1) instantiate_ssm_step_record(type, tname, 128, 128, 16, 2)            \
-      instantiate_ssm_step_record(type, tname, 128, 128, 16, 4)               \
-          instantiate_ssm_step_record(type, tname, 128, 128, 16, 8)           \
-              instantiate_ssm_step_record(type, tname, 128, 128, 32, 1)       \
-                  instantiate_ssm_step_record(type, tname, 128, 128, 32, 2)   \
-                      instantiate_ssm_step_record(                            \
-                          type, tname, 128, 128, 32, 4)                       \
-                          instantiate_ssm_step_record(                        \
-                              type, tname, 128, 128, 32, 8)                   \
-                              instantiate_ssm_step_record(                    \
-                                  type, tname, 128, 128, 48, 1)               \
-                                  instantiate_ssm_step_record(                \
-                                      type, tname, 128, 128, 48, 2)           \
-                                      instantiate_ssm_step_record(            \
-                                          type, tname, 128, 128, 48, 4)       \
-                                          instantiate_ssm_step_record(        \
-                                              type, tname, 128, 128, 48, 8)   \
-                                              instantiate_ssm_replay(         \
-                                                  type, tname, 128, 128, 16)  \
-                                                  instantiate_ssm_replay(     \
-                                                      type,                   \
-                                                      tname,                  \
-                                                      128,                    \
-                                                      128,                    \
-                                                      32)                     \
-                                                      instantiate_ssm_replay( \
-                                                          type,               \
-                                                          tname,              \
-                                                          128,                \
-                                                          128,                \
-                                                          48)
+#define instantiate_ssm_record_shape(type, tname, dh, ds)     \
+  instantiate_ssm_record_H_grid(type, tname, dh, ds, 16)      \
+  instantiate_ssm_record_H_grid(type, tname, dh, ds, 32)      \
+  instantiate_ssm_record_H_grid(type, tname, dh, ds, 48)      \
+  instantiate_ssm_record_H_grid(type, tname, dh, ds, 64)
 
-instantiate_ssm_record_dh64_ds64_for(half, float16)
-    instantiate_ssm_record_dh64_ds64_for(bfloat16_t, bfloat16)
-        instantiate_ssm_record_dh128_ds128_for(half, float16)
-            instantiate_ssm_record_dh128_ds128_for(bfloat16_t, bfloat16)
+#define instantiate_ssm_record_for_type(type, tname)          \
+  instantiate_ssm_record_shape(type, tname, 64, 64)           \
+  instantiate_ssm_record_shape(type, tname, 64, 128)          \
+  instantiate_ssm_record_shape(type, tname, 128, 128)
+
+instantiate_ssm_record_for_type(half, float16)
+instantiate_ssm_record_for_type(bfloat16_t, bfloat16)
+    // clang-format on

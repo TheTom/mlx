@@ -464,6 +464,28 @@ MLX_API array flash_quantized_sdpa(
     const std::string& mask_mode = "",
     std::optional<array> mask_arr = {},
     const std::optional<array>& sinks = {},
+    int window_size = -1,
+    StreamOrDevice s = {});
+
+/// TurboQuant fused single-pass SDPA with sinks — spec 041 phase 1.1
+/// follow-up for sinks-using models. MSE-codec equivalent of
+/// `flash_quantized_sdpa(...)`. Output is in rotated V space; caller applies
+/// the inverse codec rotation (Π_v^T) afterward.
+MLX_API array turbo_flash_sdpa_v(
+    const array& queries,
+    const array& k_packed,
+    const array& k_norms,
+    const array& k_codebook,
+    const array& v_packed,
+    const array& v_norms,
+    const array& v_codebook,
+    int key_bits,
+    int value_bits,
+    int dim,
+    int repeat_count,
+    const std::optional<array>& sinks = {},
+    bool do_causal = false,
+    int window_size = -1,
     StreamOrDevice s = {});
 
 /// Mamba state-replay primitive — sequential SSM step with per-step delta-log

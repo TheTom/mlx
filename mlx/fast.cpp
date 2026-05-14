@@ -2107,6 +2107,7 @@ array flash_quantized_sdpa(
     const std::string& mask_mode /* = "" */,
     std::optional<array> mask_arr /* = {} */,
     const std::optional<array>& sinks /* = {} */,
+    int window_size /* = -1 */,
     StreamOrDevice s_ /* = {} */) {
   auto s = to_stream(s_);
 
@@ -2119,6 +2120,10 @@ array flash_quantized_sdpa(
   if (!mask_mode.empty() && mask_mode != "causal" && mask_mode != "array") {
     throw std::invalid_argument(
         "[flash_quantized_sdpa] mask_mode must be 'causal', 'array', or ''");
+  }
+  if (window_size > 0 && !do_causal) {
+    throw std::invalid_argument(
+        "[flash_quantized_sdpa] window_size > 0 requires mask_mode='causal'");
   }
 
   int B = queries.shape(0);
@@ -2166,7 +2171,64 @@ array flash_quantized_sdpa(
           bits,
           group_size,
           n_q_heads,
-          n_kv_heads),
+          n_kv_heads,
+          window_size),
+      std::move(inputs));
+}
+
+// ============================================================================
+// Spec 041 phase 1.1 follow-up: TurboQuant fused single-pass SDPA with sinks
+// ============================================================================
+array turbo_flash_sdpa_v(
+    const array& queries,
+    const array& k_packed,
+    const array& k_norms,
+    const array& k_codebook,
+    const array& v_packed,
+    const array& v_norms,
+    const array& v_codebook,
+    int key_bits,
+    int value_bits,
+    int dim,
+    int repeat_count,
+    const std::optional<array>& sinks /* = {} */,
+    bool do_causal /* = false */,
+    int window_size /* = -1 */,
+    StreamOrDevice s_ /* = {} */) {
+  auto s = to_stream(s_);
+
+  int total_q = queries.shape(0);
+  bool has_sinks = sinks.has_value();
+
+  auto fallback = [](const std::vector<array>&) -> std::vector<array> {
+    throw std::runtime_error("[turbo_flash_sdpa_v] Only runs on GPU");
+  };
+
+  std::vector<array> inputs = {
+      astype(queries, float32, s),
+      k_packed,
+      astype(k_norms, float32, s),
+      astype(k_codebook, float32, s),
+      v_packed,
+      astype(v_norms, float32, s),
+      astype(v_codebook, float32, s)};
+  if (has_sinks) {
+    inputs.push_back(astype(*sinks, bfloat16, s));
+  }
+
+  return array(
+      {total_q, dim},
+      bfloat16,
+      std::make_shared<TurboFlashSDPA>(
+          s,
+          fallback,
+          key_bits,
+          value_bits,
+          dim,
+          repeat_count,
+          has_sinks,
+          do_causal,
+          window_size),
       std::move(inputs));
 }
 
