@@ -117,6 +117,19 @@ Buffer MetalAllocator::malloc(size_t size) {
   // Try the cache
   std::unique_lock lk(mutex_);
   MTL::Buffer* buf = buffer_cache_.reuse_from_cache(size);
+  // F-80 DETERMINISM PATCH (vllm-swift-stable fork): zero recycled
+  // buffers. Stale data from prior allocations causes cross-run
+  // non-determinism at long context decode when downstream kernels
+  // read uninitialized regions. See
+  // /Users/tom/dev/mlx-swift-lm/research/retrieval_attention/F80_CLIFF_DIAGNOSIS.md
+  //
+  // Zero only the REQUESTED size — pool can return an oversized buffer
+  // (up to 2x), and zeroing the whole buffer is a long-context bottleneck
+  // (256K prefill ballooned from minutes to tens of minutes). Kernels
+  // that read beyond their declared output size would be a separate bug.
+  if (buf) {
+    memset(buf->contents(), 0, size);
+  }
   if (!buf) {
     size_t mem_required = get_active_memory() + get_cache_memory() + size;
 
