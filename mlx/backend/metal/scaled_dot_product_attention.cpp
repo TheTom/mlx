@@ -1,4 +1,5 @@
 // Copyright © 2024 Apple Inc.
+#include <cstdlib>
 #include <sstream>
 
 #include "mlx/backend/common/compiled.h"
@@ -474,6 +475,15 @@ void sdpa_vector_2pass(
     } else {
       blocks = 32;
     }
+  }
+  // Backport of ml-explore/mlx PR #3455 (May 11 2026): runtime override
+  // for the heuristic-chosen blocks count. On M5 Max (devc='s') the default
+  // blocks=256 at N in (8K,32K] oversubs ~256 SIMDgroup slots and trips a
+  // sharp cliff at B>=4 (intermediate buffer 21MB × 48 layers exceeds SLC).
+  // Recommended sweep: 32, 64, 88, 128. PR #3455 reported best at 88 on M4 Ultra.
+  if (const char* env = std::getenv("MLX_SDPA_BLOCKS")) {
+    int override_blocks = std::atoi(env);
+    if (override_blocks > 0) blocks = override_blocks;
   }
   size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
   size_t k_seq_stride = k.strides()[2];
